@@ -457,12 +457,10 @@ def draw_core_row(win, y, x, max_w, label, pct, freq_mhz, temp=None, color_pair=
 
     # Fixed-width fields: pct always 4 chars, freq always 5 chars
     pct_str = f"{pct:3d}%"                        # "100%" or "  5%" = 4 chars
-    if freq_mhz == 0:
-        freq_str = "  -  "                         # 5 chars
-    elif freq_mhz >= 1000:
-        freq_str = f"{freq_mhz / 1000:4.1f}G"     # "2.4G " padded? no, f"{2.4:4.1f}G" = " 2.4G" = 5
+    if freq_mhz >= 1000:
+        freq_str = f"{freq_mhz / 1000:4.1f}G"
     else:
-        freq_str = f"{freq_mhz:4d}M"              # " 600M" = 5 chars
+        freq_str = f"{freq_mhz:4d}M"
     freq_str = f"{freq_str:>5s}"                   # ensure exactly 5 chars right-aligned
 
     temp_str = ""
