@@ -449,21 +449,30 @@ def safe_addstr(win, y, x, s, attr=0):
 def draw_core_row(win, y, x, max_w, label, pct, freq_mhz, temp=None, color_pair=1):
     """Draw a single core row: label bar% freq temp.
 
-    Everything is anchored from the RIGHT edge so high percentages
-    never push the suffix out of the box.
+    Suffix uses fixed-width fields so bars align across all rows.
     """
     if max_w < 20:
         return
     pct = min(pct, 100)
-    freq_str = f"{freq_mhz / 1000:.1f}G" if freq_mhz >= 1000 else f"{freq_mhz}M"
-    pct_str = f"{pct:3d}%"
-    temp_str = f"{temp:4.0f}°C" if temp is not None and temp > 0 else ""
 
-    # Fixed-width suffix anchored to the right edge
-    suffix = f" {pct_str} {freq_str}"
+    # Fixed-width fields: pct always 4 chars, freq always 5 chars
+    pct_str = f"{pct:3d}%"                        # "100%" or "  5%" = 4 chars
+    if freq_mhz == 0:
+        freq_str = "  -  "                         # 5 chars
+    elif freq_mhz >= 1000:
+        freq_str = f"{freq_mhz / 1000:4.1f}G"     # "2.4G " padded? no, f"{2.4:4.1f}G" = " 2.4G" = 5
+    else:
+        freq_str = f"{freq_mhz:4d}M"              # " 600M" = 5 chars
+    freq_str = f"{freq_str:>5s}"                   # ensure exactly 5 chars right-aligned
+
+    temp_str = ""
+    if temp is not None and temp > 0:
+        temp_str = f"{temp:4.0f}°C"               # "  45°C" = 6 chars (4 digits + °C)
+
+    # suffix: space + pct(4) + space + freq(5) [+ space + temp(6)]
+    suffix_w = 1 + 4 + 1 + 5                      # = 11 always
     if temp_str:
-        suffix += f" {temp_str}"
-    suffix_w = len(suffix)
+        suffix_w += 1 + len(temp_str)
 
     label_str = label + " "
     label_w = len(label_str)
@@ -475,8 +484,6 @@ def draw_core_row(win, y, x, max_w, label, pct, freq_mhz, temp=None, color_pair=
     fill = min(int(pct / 100 * bar_w), bar_w)
     empty = bar_w - fill
 
-    # Draw: label, filled bar, empty bar, suffix
-    # Each piece placed at an absolute column computed from x
     col = x
     safe_addstr(win, y, col, label_str, curses.color_pair(2) | curses.A_BOLD)
     col += label_w
@@ -484,12 +491,11 @@ def draw_core_row(win, y, x, max_w, label, pct, freq_mhz, temp=None, color_pair=
     col += fill
     safe_addstr(win, y, col, "░" * empty, curses.color_pair(2) | curses.A_DIM)
     col += empty
-    # Suffix parts with individual colors, positioned absolutely
     safe_addstr(win, y, col, " " + pct_str, curses.color_pair(2))
-    col += 1 + len(pct_str)
+    col += 1 + 4
     safe_addstr(win, y, col, " " + freq_str, curses.color_pair(5))
+    col += 1 + 5
     if temp_str:
-        col += 1 + len(freq_str)
         safe_addstr(win, y, col, " " + temp_str, curses.color_pair(temp_color(temp)))
 
 
