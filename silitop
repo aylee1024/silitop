@@ -449,45 +449,48 @@ def safe_addstr(win, y, x, s, attr=0):
 def draw_core_row(win, y, x, max_w, label, pct, freq_mhz, temp=None, color_pair=1):
     """Draw a single core row: label bar% freq temp.
 
-    Suffix uses fixed-width fields so bars align across all rows.
+    Suffix is anchored to a fixed column from the right so the bar
+    can never push it off-screen regardless of fill percentage.
     """
     if max_w < 20:
         return
     pct = min(pct, 100)
 
-    # Original format strings
     pct_str = f"{pct:3d}%"
     freq_str = f"{freq_mhz / 1000:.1f}G" if freq_mhz >= 1000 else f"{freq_mhz}M"
     temp_str = f"{temp:4.0f}°C" if temp is not None and temp > 0 else ""
 
-    # Suffix: " pct freq [temp]" with 1-char padding at end
-    meta_w = 1 + len(pct_str) + 1 + len(freq_str)
+    # Suffix text: " pct freq [temp]"
+    suffix = " " + pct_str + " " + freq_str
     if temp_str:
-        meta_w += 1 + len(temp_str)
+        suffix += " " + temp_str
 
     label_str = label + " "
     label_w = len(label_str)
 
-    bar_w = max_w - label_w - meta_w - 2
+    # Anchor suffix to a fixed column from the right edge
+    suffix_col = x + max_w - len(suffix) - 1
+    bar_w = suffix_col - (x + label_w)
     if bar_w < 2:
         bar_w = 2
 
     fill = min(int(pct / 100 * bar_w), bar_w)
     empty = bar_w - fill
 
-    col = x
-    safe_addstr(win, y, col, label_str, curses.color_pair(2) | curses.A_BOLD)
-    col += label_w
-    safe_addstr(win, y, col, "█" * fill, curses.color_pair(color_pair) | curses.A_BOLD)
-    col += fill
-    safe_addstr(win, y, col, "░" * empty, curses.color_pair(2) | curses.A_DIM)
-    col += empty + 1
-    safe_addstr(win, y, col, pct_str, curses.color_pair(2))
-    col += len(pct_str) + 1
-    safe_addstr(win, y, col, freq_str, curses.color_pair(5))
+    # Draw label
+    safe_addstr(win, y, x, label_str, curses.color_pair(2) | curses.A_BOLD)
+    # Draw bar (fill + empty) — always exactly bar_w characters
+    bar_x = x + label_w
+    safe_addstr(win, y, bar_x, "█" * fill, curses.color_pair(color_pair) | curses.A_BOLD)
+    safe_addstr(win, y, bar_x + fill, "░" * empty, curses.color_pair(2) | curses.A_DIM)
+    # Draw suffix at fixed position
+    col = suffix_col
+    safe_addstr(win, y, col, " " + pct_str, curses.color_pair(2))
+    col += 1 + len(pct_str)
+    safe_addstr(win, y, col, " " + freq_str, curses.color_pair(5))
     if temp_str:
-        col += len(freq_str) + 1
-        safe_addstr(win, y, col, temp_str, curses.color_pair(temp_color(temp)))
+        col += 1 + len(freq_str)
+        safe_addstr(win, y, col, " " + temp_str, curses.color_pair(temp_color(temp)))
 
 
 def draw_hbar_full(win, y, x, w, pct, label="", color_pair=1):
