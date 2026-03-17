@@ -1,0 +1,867 @@
+#!/usr/bin/env python3
+"""
+silitop - Apple Silicon performance monitor with per-core CPU display,
+temperatures, memory, and power usage.
+
+Requires: sudo (for powermetrics)
+Usage: sudo silitop [--interval N] [--color N]
+"""
+
+import argparse
+import curses
+import glob
+import os
+import plistlib
+import re
+import subprocess
+import sys
+import time
+from collections import deque
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+
+BLOCK_CHARS = " ▏▎▍▌▋▊▉█"
+COLOR_SCHEMES = {
+    0: (curses.COLOR_WHITE, curses.COLOR_BLACK),
+    1: (curses.COLOR_RED, curses.COLOR_BLACK),
+    2: (curses.COLOR_GREEN, curses.COLOR_BLACK),
+    3: (curses.COLOR_YELLOW, curses.COLOR_BLACK),
+    4: (curses.COLOR_BLUE, curses.COLOR_BLACK),
+    5: (curses.COLOR_MAGENTA, curses.COLOR_BLACK),
+    6: (curses.COLOR_CYAN, curses.COLOR_BLACK),
+}
+
+# ── Data Collection ────────────────────────────────────────────────────────────
+
+def get_soc_info():
+    """Detect SoC name, core topology, GPU cores."""
+    info = {
+        "name": "Apple Silicon",
+        "e_core_count": 4,
+        "p_core_count": 4,
+        "gpu_core_count": "?",
+        # Labels for the two CPU tiers (overridden for M5+)
+        "fast_label": "Super",
+        "slow_label": "Perf",
+        "fast_prefix": "S",
+        "slow_prefix": "P",
+    }
+    try:
+        out = subprocess.check_output(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            text=True,
+        ).strip()
+        info["name"] = out
+    except Exception:
+        pass
+
+    # Detect core tier naming from system_profiler
+    try:
+        hw = subprocess.check_output(
+            ["system_profiler", "SPHardwareDataType"], text=True, timeout=5
+        )
+        for line in hw.splitlines():
+            if "Total Number of Cores" in line:
+                # e.g. "6 Super and 12 Performance" or "2 Efficiency and 8 Performance"
+                core_desc = line.split(": ", 1)[-1].strip()
+                # e.g. "18 (6 Super and 12 Performance)" - extract from parens
+                paren = re.search(r"\((.+)\)", core_desc)
+                inner = paren.group(1) if paren else core_desc
+                # Parse "N TypeA and M TypeB"
+                m = re.match(r"(\d+)\s+(\w+)\s+and\s+(\d+)\s+(\w+)", inner)
+                if m:
+                    fast_count, fast_type = int(m.group(1)), m.group(2)
+                    slow_count, slow_type = int(m.group(3)), m.group(4)
+                    info["p_core_count"] = fast_count   # perflevel0 = fastest tier
+                    info["e_core_count"] = slow_count   # perflevel1 = second tier
+                    info["fast_label"] = fast_type       # "Super" on M5
+                    info["slow_label"] = slow_type       # "Performance" on M5
+                    info["fast_prefix"] = fast_type[0]   # "S"
+                    info["slow_prefix"] = slow_type[0]   # "P"
+    except Exception:
+        pass
+
+    # Fallback to sysctl if system_profiler didn't give us core counts
+    if info["p_core_count"] == 4:
+        try:
+            info["p_core_count"] = int(
+                subprocess.check_output(
+                    ["sysctl", "-n", "hw.perflevel0.logicalcpu"], text=True
+                ).strip()
+            )
+            info["e_core_count"] = int(
+                subprocess.check_output(
+                    ["sysctl", "-n", "hw.perflevel1.logicalcpu"], text=True
+                ).strip()
+            )
+        except Exception:
+            pass
+    # GPU core count from display profiler
+    try:
+        sp = subprocess.check_output(
+            ["system_profiler", "-detailLevel", "basic", "SPDisplaysDataType"],
+            text=True, timeout=5,
+        )
+        for line in sp.splitlines():
+            if "Total Number of Cores" in line:
+                info["gpu_core_count"] = int(line.split(": ")[-1])
+                break
+    except Exception:
+        pass
+    # TDP estimates
+    name = info["name"]
+    if "Ultra" in name:
+        info["cpu_max_power"] = 80
+        info["gpu_max_power"] = 120
+    elif "Max" in name:
+        info["cpu_max_power"] = 40
+        info["gpu_max_power"] = 60
+    elif "Pro" in name:
+        info["cpu_max_power"] = 30
+        info["gpu_max_power"] = 30
+    else:
+        info["cpu_max_power"] = 20
+        info["gpu_max_power"] = 20
+    info["ane_max_power"] = 8.0
+    return info
+
+
+def run_powermetrics(timecode, interval=1000):
+    """Start powermetrics subprocess."""
+    for f in glob.glob("/tmp/silitop_pm*"):
+        os.remove(f)
+    path = f"/tmp/silitop_pm{timecode}"
+    # Try with smc sampler first; if powermetrics rejects it, retry without
+    samplers_options = [
+        "cpu_power,gpu_power,thermal,smc",
+        "cpu_power,gpu_power,thermal",
+    ]
+    for samplers in samplers_options:
+        cmd = [
+            "nice", "-n", "10", "powermetrics",
+            "--samplers", samplers,
+            "-o", path,
+            "-f", "plist",
+            "-i", str(interval),
+        ]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        # Give it a moment to fail if sampler is invalid
+        try:
+            proc.wait(timeout=1.5)
+            # If it exited, the sampler set was rejected; try next
+            continue
+        except subprocess.TimeoutExpired:
+            # Still running = success
+            return proc, path
+    # All options failed; return last attempt anyway
+    cmd = [
+        "nice", "-n", "10", "powermetrics",
+        "--samplers", "cpu_power,gpu_power,thermal",
+        "-o", path,
+        "-f", "plist",
+        "-i", str(interval),
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    return proc, path
+
+
+def parse_powermetrics(path):
+    """Parse the plist file written by powermetrics."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return None
+    chunks = data.split(b"\x00")
+    for chunk in reversed(chunks):
+        if not chunk:
+            continue
+        try:
+            parsed = plistlib.loads(chunk)
+            return parsed
+        except Exception:
+            continue
+    return None
+
+
+def _is_efficiency(name):
+    return name[0] in ("E", "M")
+
+
+def extract_cpu(parsed):
+    """Extract per-core CPU metrics."""
+    proc = parsed.get("processor", {})
+    clusters = proc.get("clusters", [])
+    cores = {"e_cores": [], "p_cores": []}
+    agg = {}
+    e_active_list, p_active_list = [], []
+    e_freq_list, p_freq_list = [], []
+    for cluster in clusters:
+        name = cluster.get("name", "")
+        is_e = _is_efficiency(name)
+        bucket = "e_cores" if is_e else "p_cores"
+        for cpu in cluster.get("cpus", []):
+            active = int((1 - cpu.get("idle_ratio", 1)) * 100)
+            freq = int(cpu.get("freq_hz", 0) / 1e6)
+            core_id = cpu.get("cpu", 0)
+            cores[bucket].append({
+                "id": core_id,
+                "active": active,
+                "freq_mhz": freq,
+            })
+            if is_e:
+                e_active_list.append(active)
+                e_freq_list.append(freq)
+            else:
+                p_active_list.append(active)
+                p_freq_list.append(freq)
+    agg["e_active"] = int(sum(e_active_list) / max(len(e_active_list), 1))
+    agg["p_active"] = int(sum(p_active_list) / max(len(p_active_list), 1))
+    agg["e_freq"] = max(e_freq_list) if e_freq_list else 0
+    agg["p_freq"] = max(p_freq_list) if p_freq_list else 0
+    # Power (milliwatts -> watts)
+    agg["cpu_w"] = proc.get("cpu_energy", 0) / 1000
+    agg["gpu_w"] = proc.get("gpu_energy", 0) / 1000
+    agg["ane_w"] = proc.get("ane_energy", 0) / 1000
+    agg["package_w"] = proc.get("combined_power", 0) / 1000
+    return cores, agg
+
+
+def extract_gpu(parsed):
+    gpu = parsed.get("gpu", {})
+    freq = gpu.get("freq_hz", 0)
+    # GPU freq_hz in powermetrics is already in MHz (despite the key name)
+    # matching asitop behavior
+    if freq > 1e6:
+        freq = int(freq / 1e6)
+    else:
+        freq = int(freq)
+    return {
+        "active": int((1 - gpu.get("idle_ratio", 1)) * 100),
+        "freq_mhz": freq,
+    }
+
+
+def extract_thermal(parsed):
+    return parsed.get("thermal_pressure", "Unknown")
+
+
+def read_hid_temps():
+    """Read temperatures from IOHIDEventSystemClient via silitop-temps helper."""
+    temps = {}
+    try:
+        helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "silitop-temps")
+    except NameError:
+        helper = "/usr/local/bin/silitop-temps"
+    if not os.path.isfile(helper):
+        helper = "/usr/local/bin/silitop-temps"
+    if not os.path.isfile(helper):
+        return temps
+    try:
+        out = subprocess.check_output([helper], text=True, timeout=3,
+                                       stderr=subprocess.DEVNULL)
+        for line in out.strip().splitlines():
+            parts = line.split("|", 1)
+            if len(parts) == 2:
+                try:
+                    temps[parts[0]] = float(parts[1])
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    return temps
+
+
+SENSOR_LABELS = {
+    "PMU tcal": None,  # calibration, skip
+    "NAND CH0 temp": "SSD",
+    "gas gauge battery": "Battery",
+}
+
+
+def classify_temps(temps, gpu_die_zones=2):
+    """Classify temperatures into CPU die, GPU die, and other.
+
+    Apple Silicon packs CPU+GPU on one die.  The last *gpu_die_zones*
+    tdie sensors cover the GPU area (convention on M1-M5).
+    """
+    all_die = []  # (zone_num, temp)
+    other_temps = {}
+    for sensor, val in temps.items():
+        if sensor in SENSOR_LABELS:
+            label = SENSOR_LABELS[sensor]
+            if label:
+                other_temps[label] = val
+        elif sensor.startswith("PMU tdie"):
+            num = sensor.replace("PMU tdie", "")
+            try:
+                all_die.append((int(num), val))
+            except ValueError:
+                pass
+        elif sensor.startswith("PMU tdev"):
+            num = sensor.replace("PMU tdev", "")
+            other_temps[f"SoC {num}"] = val
+    all_die.sort(key=lambda x: x[0])
+
+    # Split: last gpu_die_zones entries are GPU, rest are CPU
+    if len(all_die) > gpu_die_zones:
+        cpu_die = all_die[:-gpu_die_zones]
+        gpu_die = all_die[-gpu_die_zones:]
+    else:
+        cpu_die = all_die
+        gpu_die = []
+    return cpu_die, gpu_die, other_temps
+
+
+def get_ram_metrics():
+    """Get RAM usage without psutil."""
+    info = {"total_gb": 0, "used_gb": 0, "free_gb": 0, "pct": 0,
+            "swap_total_gb": 0, "swap_used_gb": 0}
+    try:
+        total = int(subprocess.check_output(
+            ["sysctl", "-n", "hw.memsize"], text=True).strip())
+        info["total_gb"] = round(total / (1024**3), 1)
+    except Exception:
+        return info
+    try:
+        vm = subprocess.check_output(["vm_stat"], text=True)
+        page_size = 16384  # Apple Silicon default
+        m = re.search(r"page size of (\d+)", vm)
+        if m:
+            page_size = int(m.group(1))
+        fields = {}
+        for line in vm.splitlines():
+            parts = line.split(":")
+            if len(parts) == 2:
+                key = parts[0].strip()
+                val = parts[1].strip().rstrip(".")
+                try:
+                    fields[key] = int(val)
+                except ValueError:
+                    pass
+        free_pages = fields.get("Pages free", 0)
+        inactive = fields.get("Pages inactive", 0)
+        speculative = fields.get("Pages speculative", 0)
+        available_bytes = (free_pages + inactive + speculative) * page_size
+        info["free_gb"] = round(available_bytes / (1024**3), 1)
+        info["used_gb"] = round(info["total_gb"] - info["free_gb"], 1)
+        if info["total_gb"] > 0:
+            info["pct"] = int(info["used_gb"] / info["total_gb"] * 100)
+    except Exception:
+        pass
+    try:
+        sw = subprocess.check_output(["sysctl", "-n", "vm.swapusage"], text=True)
+        m_total = re.search(r"total\s*=\s*([\d.]+)M", sw)
+        m_used = re.search(r"used\s*=\s*([\d.]+)M", sw)
+        if m_total:
+            info["swap_total_gb"] = round(float(m_total.group(1)) / 1024, 1)
+        if m_used:
+            info["swap_used_gb"] = round(float(m_used.group(1)) / 1024, 1)
+    except Exception:
+        pass
+    return info
+
+
+# ── UI Drawing ─────────────────────────────────────────────────────────────────
+
+def init_colors(scheme):
+    curses.start_color()
+    curses.use_default_colors()
+    fg, bg = COLOR_SCHEMES.get(scheme, COLOR_SCHEMES[2])
+    curses.init_pair(1, fg, -1)            # main accent
+    curses.init_pair(2, curses.COLOR_WHITE, -1)  # text
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)  # warning
+    curses.init_pair(4, curses.COLOR_RED, -1)     # hot
+    curses.init_pair(5, curses.COLOR_CYAN, -1)    # cool
+    curses.init_pair(6, curses.COLOR_GREEN, -1)   # bar fill
+    curses.init_pair(7, fg, -1)            # border
+
+
+def hbar(width, pct, filled_char="█", empty_char="░"):
+    """Render a horizontal bar string of given width at pct%."""
+    if width <= 0:
+        return ""
+    fill = int(pct / 100 * width)
+    fill = min(fill, width)
+    return filled_char * fill + empty_char * (width - fill)
+
+
+def temp_color(temp):
+    """Return color pair number based on temperature."""
+    if temp < 0:
+        return 2
+    if temp < 50:
+        return 5  # cyan/cool
+    if temp < 70:
+        return 3  # yellow/warm
+    return 4  # red/hot
+
+
+def draw_box(win, y, x, h, w, title="", color_pair=7):
+    """Draw a box with optional title."""
+    if h < 2 or w < 4:
+        return
+    try:
+        # Top
+        win.addstr(y, x, "┌" + "─" * (w - 2) + "┐", curses.color_pair(color_pair))
+        if title:
+            tstr = f" {title} "
+            tx = x + 2
+            if tx + len(tstr) < x + w - 1:
+                win.addstr(y, tx, tstr, curses.color_pair(color_pair) | curses.A_BOLD)
+        # Sides
+        for row in range(y + 1, y + h - 1):
+            win.addstr(row, x, "│", curses.color_pair(color_pair))
+            try:
+                win.addstr(row, x + w - 1, "│", curses.color_pair(color_pair))
+            except curses.error:
+                pass
+        # Bottom
+        try:
+            win.addstr(y + h - 1, x, "└" + "─" * (w - 2) + "┘", curses.color_pair(color_pair))
+        except curses.error:
+            pass
+    except curses.error:
+        pass
+
+
+def safe_addstr(win, y, x, s, attr=0):
+    """addstr that won't crash on boundary writes."""
+    max_y, max_x = win.getmaxyx()
+    if y < 0 or y >= max_y or x >= max_x:
+        return
+    if x < 0:
+        s = s[-x:]
+        x = 0
+    available = max_x - x
+    if len(s) > available:
+        s = s[:available]
+    if not s:
+        return
+    try:
+        win.addstr(y, x, s, attr)
+    except curses.error:
+        pass
+
+
+def draw_core_row(win, y, x, max_w, label, pct, freq_mhz, temp=None, color_pair=1):
+    """Draw a single core row: label bar% freq temp."""
+    if max_w < 20:
+        return
+    # Format: "S0 ████░░░░  65% 2.1G  45°C"
+    freq_str = f"{freq_mhz / 1000:.1f}G" if freq_mhz >= 1000 else f"{freq_mhz}M"
+    pct_str = f"{pct:3d}%"
+    temp_str = f"{temp:4.0f}°C" if temp is not None and temp > 0 else ""
+
+    # Calculate bar width
+    label_w = len(label) + 1
+    meta_w = 1 + len(pct_str) + 1 + len(freq_str)
+    if temp_str:
+        meta_w += 1 + len(temp_str)
+    bar_w = max_w - label_w - meta_w - 2
+    if bar_w < 4:
+        bar_w = 4
+
+    safe_addstr(win, y, x, label, curses.color_pair(2) | curses.A_BOLD)
+    bx = x + label_w
+    bar = hbar(bar_w, pct)
+    # Color the filled portion
+    fill_len = int(pct / 100 * bar_w)
+    fill_len = min(fill_len, bar_w)
+    safe_addstr(win, y, bx, bar[:fill_len], curses.color_pair(color_pair) | curses.A_BOLD)
+    safe_addstr(win, y, bx + fill_len, bar[fill_len:], curses.color_pair(2) | curses.A_DIM)
+    mx = bx + bar_w + 1
+    safe_addstr(win, y, mx, pct_str, curses.color_pair(2))
+    mx += len(pct_str) + 1
+    safe_addstr(win, y, mx, freq_str, curses.color_pair(5))
+    if temp_str:
+        mx += len(freq_str) + 1
+        tc = temp_color(temp) if temp is not None else 2
+        safe_addstr(win, y, mx, temp_str, curses.color_pair(tc))
+
+
+def draw_hbar_full(win, y, x, w, pct, label="", color_pair=1):
+    """Draw a full-width horizontal bar with label."""
+    if w < 10:
+        return
+    pct_str = f" {pct:3d}%"
+    if label:
+        safe_addstr(win, y, x, label + " ", curses.color_pair(2))
+        lw = len(label) + 1
+    else:
+        lw = 0
+    bar_w = w - lw - len(pct_str) - 1
+    if bar_w < 4:
+        bar_w = 4
+    bar = hbar(bar_w, pct)
+    fill_len = int(pct / 100 * bar_w)
+    fill_len = min(fill_len, bar_w)
+    safe_addstr(win, y, x + lw, bar[:fill_len], curses.color_pair(color_pair) | curses.A_BOLD)
+    safe_addstr(win, y, x + lw + fill_len, bar[fill_len:], curses.color_pair(2) | curses.A_DIM)
+    safe_addstr(win, y, x + lw + bar_w, pct_str, curses.color_pair(2))
+
+
+def draw_spark(win, y, x, w, values, max_val, color_pair=1):
+    """Draw a mini sparkline chart."""
+    if w < 3 or not values:
+        return
+    sparks = "▁▂▃▄▅▆▇█"
+    # Take last w values
+    recent = list(values)[-w:]
+    for i, v in enumerate(recent):
+        ratio = min(v / max(max_val, 0.01), 1.0)
+        idx = int(ratio * (len(sparks) - 1))
+        safe_addstr(win, y, x + i, sparks[idx], curses.color_pair(color_pair))
+
+
+# ── Main Loop ──────────────────────────────────────────────────────────────────
+
+def main(stdscr, args):
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(200)
+    init_colors(args.color)
+
+    soc = get_soc_info()
+    header = (
+        f"{soc['name']} "
+        f"({soc['p_core_count']}{soc['fast_prefix']}+"
+        f"{soc['e_core_count']}{soc['slow_prefix']}+"
+        f"{soc['gpu_core_count']}GPU)"
+    )
+
+    # Start powermetrics
+    timecode = str(int(time.time()))
+    pm_proc, pm_path = run_powermetrics(timecode, interval=args.interval * 1000)
+
+    # Power history
+    max_history = 120
+    cpu_power_hist = deque(maxlen=max_history)
+    gpu_power_hist = deque(maxlen=max_history)
+    avg_window = int(args.avg / args.interval)
+    cpu_power_avg = deque(maxlen=avg_window)
+    gpu_power_avg = deque(maxlen=avg_window)
+    cpu_peak = 0
+    gpu_peak = 0
+    pkg_peak = 0
+
+    last_timestamp = None
+    waiting = True
+
+    try:
+        while True:
+            key = stdscr.getch()
+            if key == ord("q") or key == 27:
+                break
+
+            parsed = parse_powermetrics(pm_path)
+            if parsed is None:
+                if waiting:
+                    stdscr.erase()
+                    h, w = stdscr.getmaxyx()
+                    msg = "Waiting for powermetrics data..."
+                    safe_addstr(stdscr, h // 2, max(0, (w - len(msg)) // 2), msg,
+                                curses.color_pair(3))
+                    msg2 = "(requires sudo)"
+                    safe_addstr(stdscr, h // 2 + 1, max(0, (w - len(msg2)) // 2), msg2,
+                                curses.color_pair(2))
+                    stdscr.refresh()
+                time.sleep(0.5)
+                continue
+
+            ts = parsed.get("timestamp")
+            if ts and ts == last_timestamp:
+                time.sleep(0.1)
+                continue
+            last_timestamp = ts
+            waiting = False
+
+            # Extract metrics
+            cores, cpu_agg = extract_cpu(parsed)
+            gpu = extract_gpu(parsed)
+            thermal = extract_thermal(parsed)
+            ram = get_ram_metrics()
+
+            # Read temperatures from HID sensors
+            hid_temps = read_hid_temps()
+            cpu_die, gpu_die, other_temps = classify_temps(hid_temps)
+
+            # Power calculations
+            interval_s = args.interval
+            cpu_w = cpu_agg["cpu_w"] / interval_s
+            gpu_w = cpu_agg["gpu_w"] / interval_s
+            ane_w = cpu_agg["ane_w"] / interval_s
+            pkg_w = cpu_agg["package_w"] / interval_s
+
+            cpu_power_hist.append(cpu_w)
+            gpu_power_hist.append(gpu_w)
+            cpu_power_avg.append(cpu_w)
+            gpu_power_avg.append(gpu_w)
+            cpu_peak = max(cpu_peak, cpu_w)
+            gpu_peak = max(gpu_peak, gpu_w)
+            pkg_peak = max(pkg_peak, pkg_w)
+
+            # ── Draw UI ────────────────────────────────────────────────
+            stdscr.erase()
+            max_h, max_w = stdscr.getmaxyx()
+            if max_h < 10 or max_w < 40:
+                safe_addstr(stdscr, 0, 0, "Terminal too small", curses.color_pair(4))
+                stdscr.refresh()
+                time.sleep(1)
+                continue
+
+            row = 0
+
+            # Title bar
+            title = f" silitop - {header} "
+            safe_addstr(stdscr, row, 0, title.center(max_w),
+                        curses.color_pair(1) | curses.A_BOLD | curses.A_REVERSE)
+            row += 1
+
+            # ── CPU Cores Section ──────────────────────────────────────
+            e_cores = cores["e_cores"]
+            p_cores = cores["p_cores"]
+            e_count = len(e_cores)
+            p_count = len(p_cores)
+            # Determine layout
+            half_w = max_w // 2
+            e_box_w = half_w - 1
+            p_box_w = max_w - half_w - 1
+
+            # e_cores = slow tier (M-prefix / E-prefix), p_cores = fast tier (P-prefix)
+            slow_label = soc["slow_label"]
+            fast_label = soc["fast_label"]
+            slow_pre = soc["slow_prefix"]
+            fast_pre = soc["fast_prefix"]
+
+            # Fast cores on the left (fewer, so they get the shorter column)
+            # Slow cores on the right (more cores)
+            cpu_die_vals = [t for _, t in cpu_die]
+            cpu_die_max = max(cpu_die_vals) if cpu_die_vals else None
+            cpu_temp_str = f"  {cpu_die_max:.0f}°C" if cpu_die_max else ""
+            fast_title = f"{fast_label}: {cpu_agg['p_active']}% @ {cpu_agg['p_freq']} MHz"
+            slow_title = f"{slow_label}: {cpu_agg['e_active']}% @ {cpu_agg['e_freq']} MHz{cpu_temp_str}"
+
+            fast_box_h = p_count + 2
+            slow_box_h = e_count + 2
+            cpu_box_h = max(fast_box_h, slow_box_h)
+
+            if row + cpu_box_h < max_h:
+                draw_box(stdscr, row, 0, cpu_box_h, e_box_w, fast_title)
+                draw_box(stdscr, row, half_w, cpu_box_h, p_box_w, slow_title)
+
+                for i, core in enumerate(p_cores):
+                    label = f"{fast_pre}{i:<2d}"
+                    draw_core_row(stdscr, row + 1 + i, 2, e_box_w - 4,
+                                  label, core["active"], core["freq_mhz"])
+
+                for i, core in enumerate(e_cores):
+                    label = f"{slow_pre}{i:<2d}"
+                    draw_core_row(stdscr, row + 1 + i, half_w + 2, p_box_w - 4,
+                                  label, core["active"], core["freq_mhz"])
+
+                row += cpu_box_h
+
+            # ── GPU Section ────────────────────────────────────────────
+            gpu_box_h = 3
+            gpu_die_vals = [t for _, t in gpu_die]
+            gpu_die_max = max(gpu_die_vals) if gpu_die_vals else None
+            if row + gpu_box_h < max_h:
+                gpu_temp_str = f"  {gpu_die_max:.0f}°C" if gpu_die_max else ""
+                gpu_title = f"GPU: {gpu['active']}% @ {gpu['freq_mhz']} MHz{gpu_temp_str}"
+                draw_box(stdscr, row, 0, gpu_box_h, max_w, gpu_title)
+                draw_hbar_full(stdscr, row + 1, 2, max_w - 4, gpu["active"])
+                row += gpu_box_h
+
+            # ── ANE Section ────────────────────────────────────────────
+            ane_pct = min(int(ane_w / soc["ane_max_power"] * 100), 100)
+            ane_box_h = 3
+            if row + ane_box_h < max_h:
+                ane_title = f"ANE: {ane_pct}% @ {ane_w:.1f}W"
+                draw_box(stdscr, row, 0, ane_box_h, max_w, ane_title)
+                draw_hbar_full(stdscr, row + 1, 2, max_w - 4, ane_pct, color_pair=5)
+                row += ane_box_h
+
+            # ── Memory + Power (side by side) ──────────────────────────
+            mem_w = half_w - 1
+            pow_w = max_w - half_w - 1
+            mp_h = 6
+            if row + mp_h < max_h:
+                # Memory box
+                ram_title = f"Memory: {ram['used_gb']}/{ram['total_gb']} GB ({ram['pct']}%)"
+                draw_box(stdscr, row, 0, mp_h, mem_w, "Memory")
+                safe_addstr(stdscr, row + 1, 2,
+                            f"RAM: {ram['used_gb']}/{ram['total_gb']} GB ({ram['pct']}%)",
+                            curses.color_pair(2))
+                draw_hbar_full(stdscr, row + 2, 2, mem_w - 4, ram["pct"], color_pair=6)
+                if ram["swap_total_gb"] > 0.05:
+                    safe_addstr(stdscr, row + 3, 2,
+                                f"Swap: {ram['swap_used_gb']}/{ram['swap_total_gb']} GB",
+                                curses.color_pair(2))
+                else:
+                    safe_addstr(stdscr, row + 3, 2, "Swap: inactive",
+                                curses.color_pair(2) | curses.A_DIM)
+
+                # Power box
+                throttle = "no" if thermal == "Nominal" else f"YES ({thermal})"
+                draw_box(stdscr, row, half_w, mp_h, pow_w, "Power")
+                safe_addstr(stdscr, row + 1, half_w + 2,
+                            f"CPU: {cpu_w:.1f}W  GPU: {gpu_w:.1f}W  ANE: {ane_w:.1f}W  "
+                            f"Total: {pkg_w:.1f}W",
+                            curses.color_pair(2))
+
+                avg_cpu = sum(cpu_power_avg) / max(len(cpu_power_avg), 1)
+                avg_gpu = sum(gpu_power_avg) / max(len(gpu_power_avg), 1)
+                safe_addstr(stdscr, row + 2, half_w + 2,
+                            f"CPU avg: {avg_cpu:.1f}W pk: {cpu_peak:.1f}W  "
+                            f"GPU avg: {avg_gpu:.1f}W pk: {gpu_peak:.1f}W",
+                            curses.color_pair(2) | curses.A_DIM)
+                safe_addstr(stdscr, row + 3, half_w + 2,
+                            f"Package peak: {pkg_peak:.1f}W  Throttle: ",
+                            curses.color_pair(2))
+                tx = half_w + 2 + len(f"Package peak: {pkg_peak:.1f}W  Throttle: ")
+                tc = 4 if throttle != "no" else 6
+                safe_addstr(stdscr, row + 3, tx, throttle, curses.color_pair(tc))
+
+                # Power sparklines
+                spark_w = pow_w - 16
+                if spark_w > 10 and len(cpu_power_hist) > 1:
+                    safe_addstr(stdscr, row + 4, half_w + 2, "CPU ", curses.color_pair(2))
+                    draw_spark(stdscr, row + 4, half_w + 6, min(spark_w // 2, len(cpu_power_hist)),
+                               cpu_power_hist, soc["cpu_max_power"], color_pair=1)
+                    mid = half_w + 6 + spark_w // 2 + 2
+                    safe_addstr(stdscr, row + 4, mid, "GPU ", curses.color_pair(2))
+                    draw_spark(stdscr, row + 4, mid + 4, min(spark_w // 2, len(gpu_power_hist)),
+                               gpu_power_hist, soc["gpu_max_power"], color_pair=3)
+
+                row += mp_h
+
+            # ── Temperatures Box ───────────────────────────────────────
+            has_temps = cpu_die or gpu_die or other_temps
+            temp_box_h = 6 if has_temps else 3
+
+            if row + temp_box_h < max_h:
+                if has_temps:
+                    draw_box(stdscr, row, 0, temp_box_h, max_w, "Temperatures")
+                    cy = row + 1
+
+                    # Line 1: CPU Die summary + GPU Die + other highlights
+                    cpu_die_avg = (sum(cpu_die_vals) / len(cpu_die_vals)
+                                   if cpu_die_vals else 0)
+                    gpu_die_avg = (sum(gpu_die_vals) / len(gpu_die_vals)
+                                   if gpu_die_vals else 0)
+                    parts = []
+                    if cpu_die_vals:
+                        parts.append(f"CPU Die: {cpu_die_avg:.0f}°C (max {cpu_die_max:.0f}°C)")
+                    if gpu_die_vals:
+                        parts.append(f"GPU Die: {gpu_die_avg:.0f}°C")
+                    for label in ["SSD", "Battery"]:
+                        if label in other_temps:
+                            parts.append(f"{label}: {other_temps[label]:.0f}°C")
+                    safe_addstr(stdscr, cy, 2, "  ".join(parts), curses.color_pair(2))
+                    cy += 1
+
+                    # Line 2: CPU die zones
+                    if cpu_die:
+                        cx = 2
+                        safe_addstr(stdscr, cy, cx, "CPU ", curses.color_pair(2) | curses.A_DIM)
+                        cx += 4
+                        for zone_num, val in cpu_die:
+                            entry = f"z{zone_num}:{val:.0f}"
+                            if cx + len(entry) + 1 > max_w - 2:
+                                break
+                            safe_addstr(stdscr, cy, cx, entry,
+                                        curses.color_pair(temp_color(val)))
+                            cx += len(entry) + 1
+                        cy += 1
+
+                    # Line 3: GPU die zones
+                    if gpu_die:
+                        cx = 2
+                        safe_addstr(stdscr, cy, cx, "GPU ", curses.color_pair(2) | curses.A_DIM)
+                        cx += 4
+                        for zone_num, val in gpu_die:
+                            entry = f"z{zone_num}:{val:.0f}"
+                            if cx + len(entry) + 1 > max_w - 2:
+                                break
+                            safe_addstr(stdscr, cy, cx, entry,
+                                        curses.color_pair(temp_color(val)))
+                            cx += len(entry) + 1
+                        cy += 1
+
+                    # Thermal pressure
+                    tp_color = 4 if thermal != "Nominal" else 6
+                    tp_row = min(cy, row + temp_box_h - 2)
+                    safe_addstr(stdscr, tp_row, 2,
+                                "Thermal Pressure: ", curses.color_pair(2))
+                    safe_addstr(stdscr, tp_row, 2 + len("Thermal Pressure: "),
+                                thermal, curses.color_pair(tp_color))
+                    row += temp_box_h
+                else:
+                    safe_addstr(stdscr, row, 0, "─" * max_w, curses.color_pair(7))
+                    row += 1
+                    tp_color = 4 if thermal != "Nominal" else 6
+                    safe_addstr(stdscr, row, 2, "Thermal Pressure: ", curses.color_pair(2))
+                    safe_addstr(stdscr, row, 2 + len("Thermal Pressure: "),
+                                str(thermal), curses.color_pair(tp_color))
+                    row += 1
+
+            # Footer
+            if row < max_h:
+                footer = " q: quit | silitop "
+                safe_addstr(stdscr, min(row, max_h - 1), 0, footer.center(max_w),
+                            curses.color_pair(2) | curses.A_DIM)
+
+            stdscr.refresh()
+            time.sleep(args.interval * 0.8)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        pm_proc.terminate()
+        try:
+            pm_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pm_proc.kill()
+        for f in glob.glob("/tmp/silitop_pm*"):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
+def entry():
+    parser = argparse.ArgumentParser(
+        description="silitop: Apple Silicon performance monitor with per-core display"
+    )
+    parser.add_argument("--interval", type=int, default=1,
+                        help="Sampling interval in seconds (default: 1)")
+    parser.add_argument("--color", type=int, default=2, choices=range(7),
+                        help="Color scheme 0-6 (default: 2/green)")
+    parser.add_argument("--avg", type=int, default=30,
+                        help="Power averaging window in seconds (default: 30)")
+    parser.add_argument("--test-temps", action="store_true",
+                        help="Print temperature sensor readings and exit")
+    args = parser.parse_args()
+
+    if args.test_temps:
+        temps = read_hid_temps()
+        if not temps:
+            print("No temperature readings. Try: sudo silitop --test-temps")
+        else:
+            for sensor, val in sorted(temps.items()):
+                print(f"  {sensor}: {val:.1f}°C")
+        sys.exit(0)
+
+    if os.geteuid() != 0:
+        print("silitop requires root privileges for powermetrics.")
+        print("Run with: sudo silitop")
+        sys.exit(1)
+
+    curses.wrapper(lambda stdscr: main(stdscr, args))
+
+
+if __name__ == "__main__":
+    entry()
