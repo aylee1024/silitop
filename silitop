@@ -455,27 +455,20 @@ def draw_core_row(win, y, x, max_w, label, pct, freq_mhz, temp=None, color_pair=
         return
     pct = min(pct, 100)
 
-    # Fixed-width fields: pct always 4 chars, freq always 5 chars
-    pct_str = f"{pct:3d}%"                        # "100%" or "  5%" = 4 chars
-    if freq_mhz >= 1000:
-        freq_str = f"{freq_mhz / 1000:4.1f}G"
-    else:
-        freq_str = f"{freq_mhz:4d}M"
-    freq_str = f"{freq_str:>5s}"                   # ensure exactly 5 chars right-aligned
+    # Original format strings
+    pct_str = f"{pct:3d}%"
+    freq_str = f"{freq_mhz / 1000:.1f}G" if freq_mhz >= 1000 else f"{freq_mhz}M"
+    temp_str = f"{temp:4.0f}°C" if temp is not None and temp > 0 else ""
 
-    temp_str = ""
-    if temp is not None and temp > 0:
-        temp_str = f"{temp:4.0f}°C"               # "  45°C" = 6 chars (4 digits + °C)
-
-    # suffix: space + pct(4) + space + freq(5) [+ space + temp(6)]
-    suffix_w = 1 + 4 + 1 + 5                      # = 11 always
+    # Suffix: " pct freq [temp]" with 1-char padding at end
+    meta_w = 1 + len(pct_str) + 1 + len(freq_str)
     if temp_str:
-        suffix_w += 1 + len(temp_str)
+        meta_w += 1 + len(temp_str)
 
     label_str = label + " "
     label_w = len(label_str)
 
-    bar_w = max_w - label_w - suffix_w
+    bar_w = max_w - label_w - meta_w - 2
     if bar_w < 2:
         bar_w = 2
 
@@ -488,13 +481,13 @@ def draw_core_row(win, y, x, max_w, label, pct, freq_mhz, temp=None, color_pair=
     safe_addstr(win, y, col, "█" * fill, curses.color_pair(color_pair) | curses.A_BOLD)
     col += fill
     safe_addstr(win, y, col, "░" * empty, curses.color_pair(2) | curses.A_DIM)
-    col += empty
-    safe_addstr(win, y, col, " " + pct_str, curses.color_pair(2))
-    col += 1 + 4
-    safe_addstr(win, y, col, " " + freq_str, curses.color_pair(5))
-    col += 1 + 5
+    col += empty + 1
+    safe_addstr(win, y, col, pct_str, curses.color_pair(2))
+    col += len(pct_str) + 1
+    safe_addstr(win, y, col, freq_str, curses.color_pair(5))
     if temp_str:
-        safe_addstr(win, y, col, " " + temp_str, curses.color_pair(temp_color(temp)))
+        col += len(freq_str) + 1
+        safe_addstr(win, y, col, temp_str, curses.color_pair(temp_color(temp)))
 
 
 def draw_hbar_full(win, y, x, w, pct, label="", color_pair=1):
