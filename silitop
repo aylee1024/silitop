@@ -447,50 +447,57 @@ def safe_addstr(win, y, x, s, attr=0):
 
 
 def draw_core_row(win, y, x, max_w, label, pct, freq_mhz, temp=None, color_pair=1):
-    """Draw a single core row: label bar% freq temp."""
+    """Draw a single core row: label bar% freq temp.
+
+    Everything is anchored from the RIGHT edge so high percentages
+    never push the suffix out of the box.
+    """
     if max_w < 20:
         return
-    # Format: "S0 ████░░░░ 100% 2.1G  45°C"
+    pct = min(pct, 100)
     freq_str = f"{freq_mhz / 1000:.1f}G" if freq_mhz >= 1000 else f"{freq_mhz}M"
     pct_str = f"{pct:3d}%"
     temp_str = f"{temp:4.0f}°C" if temp is not None and temp > 0 else ""
 
-    # Build the right-side suffix with fixed width so it never shifts
+    # Fixed-width suffix anchored to the right edge
     suffix = f" {pct_str} {freq_str}"
     if temp_str:
         suffix += f" {temp_str}"
+    suffix_w = len(suffix)
 
-    # Bar gets whatever space remains after label and suffix
-    label_w = len(label) + 1
-    bar_w = max_w - label_w - len(suffix)
-    if bar_w < 4:
-        bar_w = 4
+    label_str = label + " "
+    label_w = len(label_str)
 
-    # Draw label
-    safe_addstr(win, y, x, label, curses.color_pair(2) | curses.A_BOLD)
+    bar_w = max_w - label_w - suffix_w
+    if bar_w < 2:
+        bar_w = 2
 
-    # Draw bar
-    bx = x + label_w
-    fill_len = int(pct / 100 * bar_w)
-    fill_len = min(fill_len, bar_w)
-    empty_len = bar_w - fill_len
-    safe_addstr(win, y, bx, "█" * fill_len, curses.color_pair(color_pair) | curses.A_BOLD)
-    safe_addstr(win, y, bx + fill_len, "░" * empty_len, curses.color_pair(2) | curses.A_DIM)
+    fill = min(int(pct / 100 * bar_w), bar_w)
+    empty = bar_w - fill
 
-    # Draw suffix at fixed position (right after bar)
-    sx = bx + bar_w
-    safe_addstr(win, y, sx, f" {pct_str}", curses.color_pair(2))
-    sx += 1 + len(pct_str)
-    safe_addstr(win, y, sx, f" {freq_str}", curses.color_pair(5))
+    # Draw: label, filled bar, empty bar, suffix
+    # Each piece placed at an absolute column computed from x
+    col = x
+    safe_addstr(win, y, col, label_str, curses.color_pair(2) | curses.A_BOLD)
+    col += label_w
+    safe_addstr(win, y, col, "█" * fill, curses.color_pair(color_pair) | curses.A_BOLD)
+    col += fill
+    safe_addstr(win, y, col, "░" * empty, curses.color_pair(2) | curses.A_DIM)
+    col += empty
+    # Suffix parts with individual colors, positioned absolutely
+    safe_addstr(win, y, col, " " + pct_str, curses.color_pair(2))
+    col += 1 + len(pct_str)
+    safe_addstr(win, y, col, " " + freq_str, curses.color_pair(5))
     if temp_str:
-        sx += 1 + len(freq_str)
-        safe_addstr(win, y, sx, f" {temp_str}", curses.color_pair(temp_color(temp)))
+        col += 1 + len(freq_str)
+        safe_addstr(win, y, col, " " + temp_str, curses.color_pair(temp_color(temp)))
 
 
 def draw_hbar_full(win, y, x, w, pct, label="", color_pair=1):
     """Draw a full-width horizontal bar with label."""
     if w < 10:
         return
+    pct = min(pct, 100)
     pct_str = f" {pct:3d}%"
     if label:
         safe_addstr(win, y, x, label + " ", curses.color_pair(2))
@@ -498,14 +505,16 @@ def draw_hbar_full(win, y, x, w, pct, label="", color_pair=1):
     else:
         lw = 0
     bar_w = w - lw - len(pct_str)
-    if bar_w < 4:
-        bar_w = 4
-    fill_len = int(pct / 100 * bar_w)
-    fill_len = min(fill_len, bar_w)
-    empty_len = bar_w - fill_len
-    safe_addstr(win, y, x + lw, "█" * fill_len, curses.color_pair(color_pair) | curses.A_BOLD)
-    safe_addstr(win, y, x + lw + fill_len, "░" * empty_len, curses.color_pair(2) | curses.A_DIM)
-    safe_addstr(win, y, x + lw + bar_w, pct_str, curses.color_pair(2))
+    if bar_w < 2:
+        bar_w = 2
+    fill = min(int(pct / 100 * bar_w), bar_w)
+    empty = bar_w - fill
+    col = x + lw
+    safe_addstr(win, y, col, "█" * fill, curses.color_pair(color_pair) | curses.A_BOLD)
+    col += fill
+    safe_addstr(win, y, col, "░" * empty, curses.color_pair(2) | curses.A_DIM)
+    col += empty
+    safe_addstr(win, y, col, pct_str, curses.color_pair(2))
 
 
 def draw_spark(win, y, x, w, values, max_val, color_pair=1):
