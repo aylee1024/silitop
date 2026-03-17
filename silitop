@@ -450,36 +450,41 @@ def draw_core_row(win, y, x, max_w, label, pct, freq_mhz, temp=None, color_pair=
     """Draw a single core row: label bar% freq temp."""
     if max_w < 20:
         return
-    # Format: "S0 ████░░░░  65% 2.1G  45°C"
+    # Format: "S0 ████░░░░ 100% 2.1G  45°C"
     freq_str = f"{freq_mhz / 1000:.1f}G" if freq_mhz >= 1000 else f"{freq_mhz}M"
     pct_str = f"{pct:3d}%"
     temp_str = f"{temp:4.0f}°C" if temp is not None and temp > 0 else ""
 
-    # Calculate bar width
-    label_w = len(label) + 1
-    meta_w = 1 + len(pct_str) + 1 + len(freq_str)
+    # Build the right-side suffix with fixed width so it never shifts
+    suffix = f" {pct_str} {freq_str}"
     if temp_str:
-        meta_w += 1 + len(temp_str)
-    bar_w = max_w - label_w - meta_w - 2
+        suffix += f" {temp_str}"
+
+    # Bar gets whatever space remains after label and suffix
+    label_w = len(label) + 1
+    bar_w = max_w - label_w - len(suffix)
     if bar_w < 4:
         bar_w = 4
 
+    # Draw label
     safe_addstr(win, y, x, label, curses.color_pair(2) | curses.A_BOLD)
+
+    # Draw bar
     bx = x + label_w
-    bar = hbar(bar_w, pct)
-    # Color the filled portion
     fill_len = int(pct / 100 * bar_w)
     fill_len = min(fill_len, bar_w)
-    safe_addstr(win, y, bx, bar[:fill_len], curses.color_pair(color_pair) | curses.A_BOLD)
-    safe_addstr(win, y, bx + fill_len, bar[fill_len:], curses.color_pair(2) | curses.A_DIM)
-    mx = bx + bar_w + 1
-    safe_addstr(win, y, mx, pct_str, curses.color_pair(2))
-    mx += len(pct_str) + 1
-    safe_addstr(win, y, mx, freq_str, curses.color_pair(5))
+    empty_len = bar_w - fill_len
+    safe_addstr(win, y, bx, "█" * fill_len, curses.color_pair(color_pair) | curses.A_BOLD)
+    safe_addstr(win, y, bx + fill_len, "░" * empty_len, curses.color_pair(2) | curses.A_DIM)
+
+    # Draw suffix at fixed position (right after bar)
+    sx = bx + bar_w
+    safe_addstr(win, y, sx, f" {pct_str}", curses.color_pair(2))
+    sx += 1 + len(pct_str)
+    safe_addstr(win, y, sx, f" {freq_str}", curses.color_pair(5))
     if temp_str:
-        mx += len(freq_str) + 1
-        tc = temp_color(temp) if temp is not None else 2
-        safe_addstr(win, y, mx, temp_str, curses.color_pair(tc))
+        sx += 1 + len(freq_str)
+        safe_addstr(win, y, sx, f" {temp_str}", curses.color_pair(temp_color(temp)))
 
 
 def draw_hbar_full(win, y, x, w, pct, label="", color_pair=1):
@@ -492,14 +497,14 @@ def draw_hbar_full(win, y, x, w, pct, label="", color_pair=1):
         lw = len(label) + 1
     else:
         lw = 0
-    bar_w = w - lw - len(pct_str) - 1
+    bar_w = w - lw - len(pct_str)
     if bar_w < 4:
         bar_w = 4
-    bar = hbar(bar_w, pct)
     fill_len = int(pct / 100 * bar_w)
     fill_len = min(fill_len, bar_w)
-    safe_addstr(win, y, x + lw, bar[:fill_len], curses.color_pair(color_pair) | curses.A_BOLD)
-    safe_addstr(win, y, x + lw + fill_len, bar[fill_len:], curses.color_pair(2) | curses.A_DIM)
+    empty_len = bar_w - fill_len
+    safe_addstr(win, y, x + lw, "█" * fill_len, curses.color_pair(color_pair) | curses.A_BOLD)
+    safe_addstr(win, y, x + lw + fill_len, "░" * empty_len, curses.color_pair(2) | curses.A_DIM)
     safe_addstr(win, y, x + lw + bar_w, pct_str, curses.color_pair(2))
 
 
