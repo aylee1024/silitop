@@ -388,6 +388,34 @@ def hbar(width, pct, filled_char="█", empty_char="░"):
     return filled_char * fill + empty_char * (width - fill)
 
 
+def clamp_pct(pct):
+    """Clamp a percentage to the range the UI can safely render."""
+    return max(0, min(int(pct), 100))
+
+
+def compute_bar_layout(total_width, pct, label="", suffix=""):
+    """Compute non-overlapping label, bar, and suffix spans for one row."""
+    total_width = max(int(total_width), 0)
+    pct = clamp_pct(pct)
+
+    label_w = min(len(label), total_width)
+    suffix_start = min(max(label_w, total_width - len(suffix)), total_width)
+    bar_start = label_w
+    bar_end = suffix_start
+    bar_w = max(bar_end - bar_start, 0)
+    fill_w = min(int(pct / 100 * bar_w), bar_w)
+
+    return {
+        "pct": pct,
+        "label_span": (0, label_w),
+        "bar_span": (bar_start, bar_end),
+        "suffix_span": (suffix_start, total_width),
+        "bar_width": bar_w,
+        "fill_width": fill_w,
+        "empty_width": bar_w - fill_w,
+    }
+
+
 def temp_color(temp):
     """Return color pair number based on temperature."""
     if temp < 0:
@@ -427,15 +455,23 @@ def draw_box(win, y, x, h, w, title="", color_pair=7):
         pass
 
 
-def safe_addstr(win, y, x, s, attr=0):
-    """addstr that won't crash on boundary writes."""
+def safe_addstr(win, y, x, s, attr=0, clip_right=None):
+    """addstr that won't crash on boundary writes.
+
+    clip_right, when provided, is an exclusive absolute column bound.
+    """
     max_y, max_x = win.getmaxyx()
     if y < 0 or y >= max_y or x >= max_x:
         return
     if x < 0:
         s = s[-x:]
         x = 0
-    available = max_x - x
+    max_right = max_x
+    if clip_right is not None:
+        max_right = min(max_right, clip_right)
+    available = max_right - x
+    if available <= 0:
+        return
     if len(s) > available:
         s = s[:available]
     if not s:
@@ -454,10 +490,11 @@ def draw_core_row(win, y, x, max_w, label, pct, freq_mhz, temp=None, color_pair=
     """
     if max_w < 20:
         return
-    pct = min(pct, 100)
+    pct = clamp_pct(pct)
 
     pct_str = f"{pct:3d}%"
     freq_str = f"{freq_mhz / 1000:.1f}G" if freq_mhz >= 1000 else f"{freq_mhz}M"
+    freq_str = freq_str.rjust(4)  # fixed width so all bars align
     temp_str = f"{temp:4.0f}°C" if temp is not None and temp > 0 else ""
 
     # Suffix text: " pct freq [temp]"
@@ -466,55 +503,61 @@ def draw_core_row(win, y, x, max_w, label, pct, freq_mhz, temp=None, color_pair=
         suffix += " " + temp_str
 
     label_str = label + " "
-    label_w = len(label_str)
-
-    # Anchor suffix to a fixed column from the right edge
-    suffix_col = x + max_w - len(suffix) - 1
-    bar_w = suffix_col - (x + label_w)
-    if bar_w < 2:
-        bar_w = 2
-
-    fill = min(int(pct / 100 * bar_w), bar_w)
-    empty = bar_w - fill
+    layout = compute_bar_layout(max_w, pct, label=label_str, suffix=suffix)
+    clip_right = x + max_w
 
     # Draw label
-    safe_addstr(win, y, x, label_str, curses.color_pair(2) | curses.A_BOLD)
+    safe_addstr(win, y, x, label_str, curses.color_pair(2) | curses.A_BOLD,
+                clip_right=clip_right)
     # Draw bar (fill + empty) — always exactly bar_w characters
-    bar_x = x + label_w
-    safe_addstr(win, y, bar_x, "█" * fill, curses.color_pair(color_pair) | curses.A_BOLD)
-    safe_addstr(win, y, bar_x + fill, "░" * empty, curses.color_pair(2) | curses.A_DIM)
+    bar_x = x + layout["bar_span"][0]
+    fill = layout["fill_width"]
+    empty = layout["empty_width"]
+    safe_addstr(win, y, bar_x, "█" * fill,
+                curses.color_pair(color_pair) | curses.A_BOLD,
+                clip_right=clip_right)
+    safe_addstr(win, y, bar_x + fill, "░" * empty,
+                curses.color_pair(2) | curses.A_DIM,
+                clip_right=clip_right)
     # Draw suffix at fixed position
-    col = suffix_col
-    safe_addstr(win, y, col, " " + pct_str, curses.color_pair(2))
+    col = x + layout["suffix_span"][0]
+    safe_addstr(win, y, col, " " + pct_str, curses.color_pair(2),
+                clip_right=clip_right)
     col += 1 + len(pct_str)
-    safe_addstr(win, y, col, " " + freq_str, curses.color_pair(5))
+    safe_addstr(win, y, col, " " + freq_str, curses.color_pair(5),
+                clip_right=clip_right)
     if temp_str:
         col += 1 + len(freq_str)
-        safe_addstr(win, y, col, " " + temp_str, curses.color_pair(temp_color(temp)))
+        safe_addstr(win, y, col, " " + temp_str, curses.color_pair(temp_color(temp)),
+                    clip_right=clip_right)
 
 
 def draw_hbar_full(win, y, x, w, pct, label="", color_pair=1):
     """Draw a full-width horizontal bar with label."""
     if w < 10:
         return
-    pct = min(pct, 100)
+    pct = clamp_pct(pct)
     pct_str = f" {pct:3d}%"
     if label:
-        safe_addstr(win, y, x, label + " ", curses.color_pair(2))
-        lw = len(label) + 1
+        label_str = label + " "
     else:
-        lw = 0
-    bar_w = w - lw - len(pct_str)
-    if bar_w < 2:
-        bar_w = 2
-    fill = min(int(pct / 100 * bar_w), bar_w)
-    empty = bar_w - fill
-    col = x + lw
-    safe_addstr(win, y, col, "█" * fill, curses.color_pair(color_pair) | curses.A_BOLD)
+        label_str = ""
+    layout = compute_bar_layout(w, pct, label=label_str, suffix=pct_str)
+    clip_right = x + w
+
+    if label_str:
+        safe_addstr(win, y, x, label_str, curses.color_pair(2),
+                    clip_right=clip_right)
+    fill = layout["fill_width"]
+    empty = layout["empty_width"]
+    col = x + layout["bar_span"][0]
+    safe_addstr(win, y, col, "█" * fill, curses.color_pair(color_pair) | curses.A_BOLD,
+                clip_right=clip_right)
     col += fill
-    safe_addstr(win, y, col, "░" * empty, curses.color_pair(2) | curses.A_DIM)
-    col += empty
-    safe_addstr(win, y, col, pct_str, curses.color_pair(2))
+    safe_addstr(win, y, col, "░" * empty, curses.color_pair(2) | curses.A_DIM,
+                clip_right=clip_right)
+    col = x + layout["suffix_span"][0]
+    safe_addstr(win, y, col, pct_str, curses.color_pair(2), clip_right=clip_right)
 
 
 def draw_spark(win, y, x, w, values, max_val, color_pair=1):
