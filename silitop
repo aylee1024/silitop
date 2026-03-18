@@ -202,9 +202,18 @@ def extract_cpu(parsed):
         name = cluster.get("name", "")
         is_e = _is_efficiency(name)
         bucket = "e_cores" if is_e else "p_cores"
+        cluster_freq_hz = cluster.get("freq_hz", 0)
         for cpu in cluster.get("cpus", []):
             active = int((1 - cpu.get("idle_ratio", 1)) * 100)
-            freq = int(cpu.get("freq_hz", 0) / 1e6)
+            core_freq_hz = cpu.get("freq_hz", 0)
+            # powermetrics reports freq_hz=0 for cores at 100% utilization;
+            # fall back to the cluster-level frequency
+            if core_freq_hz > 0:
+                freq = int(core_freq_hz / 1e6)
+            elif cluster_freq_hz > 0:
+                freq = int(cluster_freq_hz / 1e6)
+            else:
+                freq = 0
             core_id = cpu.get("cpu", 0)
             cores[bucket].append({
                 "id": core_id,
@@ -603,6 +612,7 @@ def main(stdscr, args):
     cpu_peak = 0
     gpu_peak = 0
     pkg_peak = 0
+    freq_cache = {}  # core_id -> last known freq_mhz (fallback for freq=0)
 
     last_timestamp = None
     waiting = True
@@ -637,6 +647,13 @@ def main(stdscr, args):
 
             # Extract metrics
             cores, cpu_agg = extract_cpu(parsed)
+            # Freq cache: use last known value when powermetrics reports 0
+            for core in cores["e_cores"] + cores["p_cores"]:
+                cid = core["id"]
+                if core["freq_mhz"] > 0:
+                    freq_cache[cid] = core["freq_mhz"]
+                elif cid in freq_cache:
+                    core["freq_mhz"] = freq_cache[cid]
             gpu = extract_gpu(parsed)
             thermal = extract_thermal(parsed)
             ram = get_ram_metrics()
