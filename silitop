@@ -230,7 +230,7 @@ def extract_cpu(parsed):
     agg["p_active"] = int(sum(p_active_list) / max(len(p_active_list), 1))
     agg["e_freq"] = max(e_freq_list) if e_freq_list else 0
     agg["p_freq"] = max(p_freq_list) if p_freq_list else 0
-    # Power (milliwatts -> watts)
+    # Power (millijoules -> joules; divided by interval in main loop to get watts)
     agg["cpu_w"] = proc.get("cpu_energy", 0) / 1000
     agg["gpu_w"] = proc.get("gpu_energy", 0) / 1000
     agg["ane_w"] = proc.get("ane_energy", 0) / 1000
@@ -727,12 +727,12 @@ def main(stdscr, args):
                 draw_box(stdscr, row, half_w, cpu_box_h, p_box_w, slow_title)
 
                 for i, core in enumerate(p_cores):
-                    label = f"{fast_pre}{i:<2d}"
+                    label = f"{fast_pre}{i+1:<2d}"
                     draw_core_row(stdscr, row + 1 + i, 2, e_box_w - 4,
                                   label, core["active"], core["freq_mhz"])
 
                 for i, core in enumerate(e_cores):
-                    label = f"{slow_pre}{i:<2d}"
+                    label = f"{slow_pre}{i+1:<2d}"
                     draw_core_row(stdscr, row + 1 + i, half_w + 2, p_box_w - 4,
                                   label, core["active"], core["freq_mhz"])
 
