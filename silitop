@@ -168,19 +168,29 @@ def run_powermetrics(timecode, interval=1000):
 
 
 def parse_powermetrics(path):
-    """Parse the plist file written by powermetrics."""
+    """Parse the most recent sample from the plist file written by powermetrics.
+
+    Reads only the tail of the file (last 64 KB) instead of the whole
+    thing, keeping each cycle O(1) regardless of how long the process
+    has been running.  Uses split+iterate (like the original) so that
+    a partially-written chunk is skipped gracefully.
+    """
     try:
         with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            if size == 0:
+                return None
+            f.seek(-min(size, 65536), 2)
             data = f.read()
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError):
         return None
     chunks = data.split(b"\x00")
     for chunk in reversed(chunks):
         if not chunk:
             continue
         try:
-            parsed = plistlib.loads(chunk)
-            return parsed
+            return plistlib.loads(chunk)
         except Exception:
             continue
     return None
@@ -257,16 +267,24 @@ def extract_thermal(parsed):
     return parsed.get("thermal_pressure", "Unknown")
 
 
-def read_hid_temps():
+def _find_helper(name):
+    """Resolve path to a compiled helper binary (once at startup)."""
+    try:
+        local = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    except NameError:
+        local = None
+    if local and os.path.isfile(local):
+        return local
+    system = f"/usr/local/bin/{name}"
+    if os.path.isfile(system):
+        return system
+    return None
+
+
+def read_hid_temps(helper):
     """Read temperatures from IOHIDEventSystemClient via silitop-temps helper."""
     temps = {}
-    try:
-        helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "silitop-temps")
-    except NameError:
-        helper = "/usr/local/bin/silitop-temps"
-    if not os.path.isfile(helper):
-        helper = "/usr/local/bin/silitop-temps"
-    if not os.path.isfile(helper):
+    if not helper:
         return temps
     try:
         out = subprocess.check_output([helper], text=True, timeout=3,
@@ -281,6 +299,29 @@ def read_hid_temps():
     except Exception:
         pass
     return temps
+
+
+def read_fan_speeds(helper):
+    """Read fan speeds from SMC via silitop-fans helper."""
+    fans = []
+    if not helper:
+        return fans
+    try:
+        out = subprocess.check_output([helper], text=True, timeout=3,
+                                       stderr=subprocess.DEVNULL)
+        for line in out.strip().splitlines():
+            parts = line.split("|")
+            if len(parts) == 3:
+                try:
+                    fans.append({
+                        "rpm": float(parts[1]),
+                        "max_rpm": float(parts[2]),
+                    })
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    return fans
 
 
 SENSOR_LABELS = {
@@ -324,16 +365,11 @@ def classify_temps(temps, gpu_die_zones=2):
     return cpu_die, gpu_die, other_temps
 
 
-def get_ram_metrics():
-    """Get RAM usage without psutil."""
-    info = {"total_gb": 0, "used_gb": 0, "free_gb": 0, "pct": 0,
+def get_ram_metrics(total_bytes):
+    """Get RAM usage without psutil.  total_bytes is cached hw.memsize."""
+    total_gb = round(total_bytes / (1024**3), 1)
+    info = {"total_gb": total_gb, "used_gb": 0, "free_gb": 0, "pct": 0,
             "swap_total_gb": 0, "swap_used_gb": 0}
-    try:
-        total = int(subprocess.check_output(
-            ["sysctl", "-n", "hw.memsize"], text=True).strip())
-        info["total_gb"] = round(total / (1024**3), 1)
-    except Exception:
-        return info
     try:
         vm = subprocess.check_output(["vm_stat"], text=True)
         page_size = 16384  # Apple Silicon default
@@ -541,6 +577,38 @@ def draw_core_row(win, y, x, max_w, label, pct, freq_mhz, temp=None, color_pair=
                     clip_right=clip_right)
 
 
+def draw_fan_row(win, y, x, max_w, label, pct, rpm, color_pair=1):
+    """Draw a single fan row: label bar pct% RPMr."""
+    if max_w < 20:
+        return
+    pct = clamp_pct(pct)
+    pct_str = f"{pct:3d}%"
+    rpm_str = f"{int(rpm)}r"
+    rpm_str = rpm_str.rjust(5)
+    suffix = " " + pct_str + " " + rpm_str
+    label_str = label + " "
+    layout = compute_bar_layout(max_w, pct, label=label_str, suffix=suffix)
+    clip_right = x + max_w
+
+    safe_addstr(win, y, x, label_str, curses.color_pair(2) | curses.A_BOLD,
+                clip_right=clip_right)
+    bar_x = x + layout["bar_span"][0]
+    fill = layout["fill_width"]
+    empty = layout["empty_width"]
+    safe_addstr(win, y, bar_x, "█" * fill,
+                curses.color_pair(color_pair) | curses.A_BOLD,
+                clip_right=clip_right)
+    safe_addstr(win, y, bar_x + fill, "░" * empty,
+                curses.color_pair(2) | curses.A_DIM,
+                clip_right=clip_right)
+    col = x + layout["suffix_span"][0]
+    safe_addstr(win, y, col, " " + pct_str, curses.color_pair(2),
+                clip_right=clip_right)
+    col += 1 + len(pct_str)
+    safe_addstr(win, y, col, " " + rpm_str, curses.color_pair(5),
+                clip_right=clip_right)
+
+
 def draw_hbar_full(win, y, x, w, pct, label="", color_pair=1):
     """Draw a full-width horizontal bar with label."""
     if w < 10:
@@ -602,6 +670,12 @@ def main(stdscr, args):
     timecode = str(int(time.time()))
     pm_proc, pm_path = run_powermetrics(timecode, interval=args.interval * 1000)
 
+    # One-time lookups
+    total_mem_bytes = int(subprocess.check_output(
+        ["sysctl", "-n", "hw.memsize"], text=True).strip())
+    temps_helper = _find_helper("silitop-temps")
+    fans_helper = _find_helper("silitop-fans")
+
     # Power history
     max_history = 120
     cpu_power_hist = deque(maxlen=max_history)
@@ -616,6 +690,11 @@ def main(stdscr, args):
 
     last_timestamp = None
     waiting = True
+    fan_available = True   # assume fans exist until first check
+    fan_seen = False       # set True after first successful read
+    fan_data = []
+    hid_temps = {}
+    slow_poll_counter = 0  # throttle temps/fans to every 3 cycles
 
     try:
         while True:
@@ -656,10 +735,18 @@ def main(stdscr, args):
                     core["freq_mhz"] = freq_cache[cid]
             gpu = extract_gpu(parsed)
             thermal = extract_thermal(parsed)
-            ram = get_ram_metrics()
+            ram = get_ram_metrics(total_mem_bytes)
 
-            # Read temperatures from HID sensors
-            hid_temps = read_hid_temps()
+            # Read temps and fans every 3 cycles (they change slowly)
+            if slow_poll_counter % 3 == 0:
+                hid_temps = read_hid_temps(temps_helper)
+                if fan_available:
+                    fan_data = read_fan_speeds(fans_helper)
+                    if not fan_data and not fan_seen:
+                        fan_available = False
+                    elif fan_data:
+                        fan_seen = True
+            slow_poll_counter += 1
             cpu_die, gpu_die, other_temps = classify_temps(hid_temps)
 
             # Power calculations
@@ -723,7 +810,35 @@ def main(stdscr, args):
             cpu_box_h = max(fast_box_h, slow_box_h)
 
             if row + cpu_box_h < max_h:
-                draw_box(stdscr, row, 0, cpu_box_h, e_box_w, fast_title)
+                # Left column: Super box + optional Fans box below
+                blank_rows = cpu_box_h - fast_box_h
+                show_fan_box = fan_data and blank_rows >= 3
+
+                if show_fan_box:
+                    draw_box(stdscr, row, 0, fast_box_h, e_box_w, fast_title)
+                    fans_box_h = blank_rows
+                    draw_box(stdscr, row + fast_box_h, 0, fans_box_h,
+                             e_box_w, "Fans")
+                    for fi, fan in enumerate(fan_data):
+                        if fi >= fans_box_h - 2:
+                            break
+                        rpm = fan["rpm"]
+                        max_rpm = fan["max_rpm"]
+                        pct = int(rpm / max_rpm * 100) if max_rpm > 0 else 0
+                        fan_label = f"F{fi+1:<2d}"
+                        fan_y = row + fast_box_h + 1 + fi
+                        if rpm == 0:
+                            safe_addstr(stdscr, fan_y, 2,
+                                        fan_label + "  off",
+                                        curses.color_pair(2) | curses.A_DIM,
+                                        clip_right=e_box_w - 1)
+                        else:
+                            draw_fan_row(stdscr, fan_y, 2,
+                                         e_box_w - 4, fan_label, pct, rpm)
+                else:
+                    draw_box(stdscr, row, 0, cpu_box_h, e_box_w, fast_title)
+
+                # Right column: Performance box (always full height)
                 draw_box(stdscr, row, half_w, cpu_box_h, p_box_w, slow_title)
 
                 for i, core in enumerate(p_cores):
@@ -921,7 +1036,7 @@ def entry():
     args = parser.parse_args()
 
     if args.test_temps:
-        temps = read_hid_temps()
+        temps = read_hid_temps(_find_helper("silitop-temps"))
         if not temps:
             print("No temperature readings. Try: sudo silitop --test-temps")
         else:

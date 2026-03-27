@@ -2,7 +2,7 @@
 
 A CLI performance monitor for Apple Silicon Macs, inspired by [asitop](https://github.com/tlkh/asitop).
 
-Shows per-core CPU utilization, GPU usage, power consumption, memory, and die temperatures in a single dashboard.
+Shows per-core CPU utilization, GPU usage, fan speed, power consumption, memory, and die temperatures in a single dashboard.
 
 ![silitop screenshot](screenshot.png)
 
@@ -11,6 +11,7 @@ Shows per-core CPU utilization, GPU usage, power consumption, memory, and die te
 - **Per-core CPU bars** with usage % and frequency for every core
 - **Automatic core tier detection**: Super/Performance (M5), Efficiency/Performance (M1-M4)
 - **GPU utilization** bar with frequency and die temperature
+- **Fan speed** RPM and percentage bars (shown in CPU box blank space on asymmetric-core chips)
 - **ANE** (Apple Neural Engine) usage
 - **Memory** usage with swap status
 - **Power** consumption: per-subsystem watts, averages, peaks, sparkline history
@@ -35,7 +36,7 @@ cd silitop
 bash install.sh
 ```
 
-The install script compiles the Swift temperature helper and copies both binaries to `/usr/local/bin/`.
+The install script compiles the Swift helpers and copies all binaries to `/usr/local/bin/`.
 
 ## Usage
 
@@ -58,6 +59,7 @@ Press `q` or `Esc` to quit.
 
 - **CPU/GPU/Power data**: reads Apple's `powermetrics` tool (plist output), same source as asitop
 - **Temperatures**: compiled Swift helper reads IOHIDEventSystemClient thermal sensors (no SMC hacks)
+- **Fan speed**: compiled Swift helper reads AppleSMC via IOKit for fan RPM
 - **Memory**: parses `vm_stat` and `sysctl` (no psutil dependency)
 
 ## Architecture
@@ -69,8 +71,12 @@ silitop (Python, curses UI)
   |     writes plist to /tmp/silitop_pm*
   |
   |-- silitop-temps (compiled Swift binary)
-        reads IOHIDEventSystemClient temperature sensors
-        outputs sensor_name|temperature pairs
+  |     reads IOHIDEventSystemClient temperature sensors
+  |     outputs sensor_name|temperature pairs
+  |
+  |-- silitop-fans (compiled Swift binary)
+        reads AppleSMC fan RPM via IOKit
+        outputs FAN0|rpm|max_rpm pairs
 ```
 
 ## Differences from asitop
@@ -80,6 +86,7 @@ silitop (Python, curses UI)
 | Per-core CPU bars | Optional (`--show_cores`) | Always shown |
 | Temperatures | No | Yes (14 die zones + SSD + battery) |
 | GPU die temp | No | Yes |
+| Fan speed | No | Yes (RPM + % bar) |
 | Dependencies | psutil, dashing, blessed | None (stdlib only) |
 | Core tier labels | E-CPU/P-CPU only | Auto-detects (Super/Performance on M5) |
 | UI framework | blessed + dashing | Pure curses |
@@ -89,7 +96,6 @@ silitop (Python, curses UI)
 Contributions welcome. Some areas that could use help:
 
 - **Per-core temperature mapping**: the 14 die zone sensors don't map 1:1 to cores. If you can figure out the exact mapping for your chip, open an issue.
-- **Fan speed**: MacBooks with fans could show RPM data.
 - **M1/M2/M3/M4 testing**: built and tested on M5 Pro, needs validation on older chips.
 - **Better TDP estimates**: power gauge percentages depend on max power estimates per SoC variant.
 - **Bandwidth counters**: powermetrics exposes memory bandwidth data that could be displayed.
