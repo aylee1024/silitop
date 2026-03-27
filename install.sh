@@ -32,8 +32,9 @@ if ! command -v python3 &>/dev/null; then
     exit 1
 fi
 
-echo "[1/3] Compiling temperature reader..."
+echo "[1/3] Compiling helpers..."
 swiftc -O silitop-temps.swift -o silitop-temps
+swiftc -O silitop-fans.swift -o silitop-fans
 echo "      Done."
 
 echo "[2/3] Installing to ${INSTALL_DIR}..."
@@ -41,6 +42,8 @@ sudo cp silitop "${INSTALL_DIR}/silitop"
 sudo chmod +x "${INSTALL_DIR}/silitop"
 sudo cp silitop-temps "${INSTALL_DIR}/silitop-temps"
 sudo chmod +x "${INSTALL_DIR}/silitop-temps"
+sudo cp silitop-fans "${INSTALL_DIR}/silitop-fans"
+sudo chmod +x "${INSTALL_DIR}/silitop-fans"
 echo "      Done."
 
 echo "[3/3] Verifying installation..."
