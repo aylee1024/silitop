@@ -2,7 +2,7 @@
 
 A CLI performance monitor for Apple Silicon Macs, inspired by [asitop](https://github.com/tlkh/asitop).
 
-Shows per-core CPU utilization, GPU usage, fan speed, power consumption, memory, and die temperatures in a single dashboard.
+Shows per-core CPU utilization, GPU usage, fan speed, network/disk I/O, power consumption, memory, and die temperatures in a single dashboard.
 
 ![silitop screenshot](screenshot.png)
 
@@ -13,6 +13,8 @@ Shows per-core CPU utilization, GPU usage, fan speed, power consumption, memory,
 - **GPU utilization** bar with frequency and die temperature
 - **Fan speed** RPM and percentage bars (shown in CPU box blank space on asymmetric-core chips)
 - **ANE** (Apple Neural Engine) usage
+- **Network** throughput with in/out sparklines
+- **Disk I/O** throughput with read/write sparklines
 - **Memory** usage with swap status
 - **Power** consumption: per-subsystem watts, averages, peaks, sparkline history
 - **Die temperatures**: 14 thermal zones (CPU + GPU), SSD, battery
@@ -60,6 +62,7 @@ Press `q` or `Esc` to quit.
 - **CPU/GPU/Power data**: reads Apple's `powermetrics` tool (plist output), same source as asitop
 - **Temperatures**: compiled Swift helper reads IOHIDEventSystemClient thermal sensors (no SMC hacks)
 - **Fan speed**: compiled Swift helper reads AppleSMC via IOKit for fan RPM
+- **Network/Disk**: `powermetrics` network and disk samplers (same subprocess, zero extra cost)
 - **Memory**: parses `vm_stat` and `sysctl` (no psutil dependency)
 
 ## Architecture
@@ -67,7 +70,7 @@ Press `q` or `Esc` to quit.
 ```
 silitop (Python, curses UI)
   |
-  |-- powermetrics subprocess (cpu_power, gpu_power, thermal samplers)
+  |-- powermetrics subprocess (cpu_power, gpu_power, thermal, network, disk)
   |     writes plist to /tmp/silitop_pm*
   |
   |-- silitop-temps (compiled Swift binary)
