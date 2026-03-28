@@ -133,8 +133,8 @@ def run_powermetrics(timecode, interval=1000):
     path = f"/tmp/silitop_pm{timecode}"
     # Try with smc sampler first; if powermetrics rejects it, retry without
     samplers_options = [
-        "cpu_power,gpu_power,thermal,smc",
-        "cpu_power,gpu_power,thermal",
+        "cpu_power,gpu_power,thermal,network,disk,smc",
+        "cpu_power,gpu_power,thermal,network,disk",
     ]
     for samplers in samplers_options:
         cmd = [
@@ -157,7 +157,7 @@ def run_powermetrics(timecode, interval=1000):
     # All options failed; return last attempt anyway
     cmd = [
         "nice", "-n", "10", "powermetrics",
-        "--samplers", "cpu_power,gpu_power,thermal",
+        "--samplers", "cpu_power,gpu_power,thermal,network,disk",
         "-o", path,
         "-f", "plist",
         "-i", str(interval),
@@ -265,6 +265,35 @@ def extract_gpu(parsed):
 
 def extract_thermal(parsed):
     return parsed.get("thermal_pressure", "Unknown")
+
+
+def extract_network(parsed):
+    """Extract network throughput rates (bytes/sec) from the network sampler."""
+    net = parsed.get("network", {})
+    return {
+        "in_rate": net.get("ibyte_rate", 0),
+        "out_rate": net.get("obyte_rate", 0),
+    }
+
+
+def extract_disk(parsed):
+    """Extract disk throughput rates (bytes/sec) from the disk sampler."""
+    dsk = parsed.get("disk", {})
+    return {
+        "read_rate": dsk.get("rbytes_per_s", 0),
+        "write_rate": dsk.get("wbytes_per_s", 0),
+    }
+
+
+def format_rate(bps):
+    """Format bytes/sec as a human-readable rate string."""
+    if bps >= 1024 * 1024 * 1024:
+        return f"{bps / (1024**3):.1f} GB/s"
+    if bps >= 1024 * 1024:
+        return f"{bps / (1024**2):.1f} MB/s"
+    if bps >= 1024:
+        return f"{bps / 1024:.0f} KB/s"
+    return f"{bps:.0f} B/s"
 
 
 def _find_helper(name):
@@ -695,6 +724,10 @@ def main(stdscr, args):
     fan_data = []
     hid_temps = {}
     slow_poll_counter = 0  # throttle temps/fans to every 3 cycles
+    net_in_hist = deque(maxlen=max_history)
+    net_out_hist = deque(maxlen=max_history)
+    disk_r_hist = deque(maxlen=max_history)
+    disk_w_hist = deque(maxlen=max_history)
 
     try:
         while True:
@@ -735,6 +768,8 @@ def main(stdscr, args):
                     core["freq_mhz"] = freq_cache[cid]
             gpu = extract_gpu(parsed)
             thermal = extract_thermal(parsed)
+            net = extract_network(parsed)
+            disk = extract_disk(parsed)
             ram = get_ram_metrics(total_mem_bytes)
 
             # Read temps and fans every 3 cycles (they change slowly)
@@ -763,6 +798,16 @@ def main(stdscr, args):
             cpu_peak = max(cpu_peak, cpu_w)
             gpu_peak = max(gpu_peak, gpu_w)
             pkg_peak = max(pkg_peak, pkg_w)
+
+            # Network + disk rates (already bytes/sec from powermetrics)
+            net_in_rate = net["in_rate"]
+            net_out_rate = net["out_rate"]
+            disk_r_rate = disk["read_rate"]
+            disk_w_rate = disk["write_rate"]
+            net_in_hist.append(net_in_rate)
+            net_out_hist.append(net_out_rate)
+            disk_r_hist.append(disk_r_rate)
+            disk_w_hist.append(disk_w_rate)
 
             # ── Draw UI ────────────────────────────────────────────────
             stdscr.erase()
@@ -873,10 +918,55 @@ def main(stdscr, args):
                 draw_hbar_full(stdscr, row + 1, 2, max_w - 4, ane_pct, color_pair=5)
                 row += ane_box_h
 
+            # ── Network + Disk (side by side) ─────────────────────────
+            nd_h = 3
+            if row + nd_h < max_h:
+                net_w = half_w - 1
+                disk_w = max_w - half_w - 1
+                net_title = (f"Net: \u2193{format_rate(net_in_rate)} "
+                             f"\u2191{format_rate(net_out_rate)}")
+                disk_title = (f"Disk: R {format_rate(disk_r_rate)} "
+                              f"W {format_rate(disk_w_rate)}")
+                draw_box(stdscr, row, 0, nd_h, net_w, net_title)
+                draw_box(stdscr, row, half_w, nd_h, disk_w, disk_title)
+
+                spark_avail = net_w - 4
+                if spark_avail > 10 and len(net_in_hist) > 1:
+                    hw = spark_avail // 2
+                    net_in_max = max(max(net_in_hist), 1)
+                    net_out_max = max(max(net_out_hist), 1)
+                    safe_addstr(stdscr, row + 1, 2, "\u2193", curses.color_pair(5))
+                    draw_spark(stdscr, row + 1, 3, min(hw - 1, len(net_in_hist)),
+                               net_in_hist, net_in_max, color_pair=5)
+                    mid_n = 2 + hw + 1
+                    safe_addstr(stdscr, row + 1, mid_n, "\u2191", curses.color_pair(4))
+                    draw_spark(stdscr, row + 1, mid_n + 1,
+                               min(hw - 1, len(net_out_hist)),
+                               net_out_hist, net_out_max, color_pair=4)
+
+                dsk_avail = disk_w - 4
+                if dsk_avail > 10 and len(disk_r_hist) > 1:
+                    hw = dsk_avail // 2
+                    disk_r_max = max(max(disk_r_hist), 1)
+                    disk_w_max = max(max(disk_w_hist), 1)
+                    safe_addstr(stdscr, row + 1, half_w + 2, "R",
+                                curses.color_pair(5))
+                    draw_spark(stdscr, row + 1, half_w + 3,
+                               min(hw - 1, len(disk_r_hist)),
+                               disk_r_hist, disk_r_max, color_pair=5)
+                    mid_d = half_w + 2 + hw + 1
+                    safe_addstr(stdscr, row + 1, mid_d, "W",
+                                curses.color_pair(4))
+                    draw_spark(stdscr, row + 1, mid_d + 1,
+                               min(hw - 1, len(disk_w_hist)),
+                               disk_w_hist, disk_w_max, color_pair=4)
+
+                row += nd_h
+
             # ── Memory + Power (side by side) ──────────────────────────
             mem_w = half_w - 1
             pow_w = max_w - half_w - 1
-            mp_h = 6
+            mp_h = 7
             if row + mp_h < max_h:
                 # Memory box
                 ram_title = f"Memory: {ram['used_gb']}/{ram['total_gb']} GB ({ram['pct']}%)"
@@ -914,16 +1004,21 @@ def main(stdscr, args):
                 tc = 4 if throttle != "no" else 6
                 safe_addstr(stdscr, row + 3, tx, throttle, curses.color_pair(tc))
 
-                # Power sparklines
-                spark_w = pow_w - 16
+                # Power sparklines (each gets its own full-width row)
+                spark_w = pow_w - 8
                 if spark_w > 10 and len(cpu_power_hist) > 1:
-                    safe_addstr(stdscr, row + 4, half_w + 2, "CPU ", curses.color_pair(2))
-                    draw_spark(stdscr, row + 4, half_w + 6, min(spark_w // 2, len(cpu_power_hist)),
-                               cpu_power_hist, soc["cpu_max_power"], color_pair=1)
-                    mid = half_w + 6 + spark_w // 2 + 2
-                    safe_addstr(stdscr, row + 4, mid, "GPU ", curses.color_pair(2))
-                    draw_spark(stdscr, row + 4, mid + 4, min(spark_w // 2, len(gpu_power_hist)),
-                               gpu_power_hist, soc["gpu_max_power"], color_pair=3)
+                    safe_addstr(stdscr, row + 4, half_w + 2, "CPU ",
+                                curses.color_pair(2))
+                    draw_spark(stdscr, row + 4, half_w + 6,
+                               min(spark_w, len(cpu_power_hist)),
+                               cpu_power_hist, soc["cpu_max_power"],
+                               color_pair=1)
+                    safe_addstr(stdscr, row + 5, half_w + 2, "GPU ",
+                                curses.color_pair(2))
+                    draw_spark(stdscr, row + 5, half_w + 6,
+                               min(spark_w, len(gpu_power_hist)),
+                               gpu_power_hist, soc["gpu_max_power"],
+                               color_pair=3)
 
                 row += mp_h
 
