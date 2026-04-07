@@ -196,11 +196,11 @@ def parse_powermetrics(path):
     return None
 
 
-def _is_efficiency(name):
-    return name[0] in ("E", "M")
+def _is_efficiency(name, slow_prefix):
+    return name[0] == slow_prefix
 
 
-def extract_cpu(parsed):
+def extract_cpu(parsed, soc):
     """Extract per-core CPU metrics."""
     proc = parsed.get("processor", {})
     clusters = proc.get("clusters", [])
@@ -210,7 +210,7 @@ def extract_cpu(parsed):
     e_freq_list, p_freq_list = [], []
     for cluster in clusters:
         name = cluster.get("name", "")
-        is_e = _is_efficiency(name)
+        is_e = _is_efficiency(name, soc["slow_prefix"])
         bucket = "e_cores" if is_e else "p_cores"
         cluster_freq_hz = cluster.get("freq_hz", 0)
         for cpu in cluster.get("cpus", []):
@@ -758,7 +758,7 @@ def main(stdscr, args):
             waiting = False
 
             # Extract metrics
-            cores, cpu_agg = extract_cpu(parsed)
+            cores, cpu_agg = extract_cpu(parsed, soc)
             # Freq cache: use last known value when powermetrics reports 0
             for core in cores["e_cores"] + cores["p_cores"]:
                 cid = core["id"]
