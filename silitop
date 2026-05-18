@@ -395,34 +395,72 @@ def classify_temps(temps, gpu_die_zones=2):
 
 
 def get_ram_metrics(total_bytes):
-    """Get RAM usage without psutil.  total_bytes is cached hw.memsize."""
+    """Get RAM usage without psutil.  total_bytes is cached hw.memsize.
+
+    Uses Activity Monitor-style accounting on macOS:
+      used = total - (free + speculative + file_backed + purgeable)
+    Falls back to (wired + compressor + anonymous - purgeable) when
+    File-backed pages is unavailable, and finally to the legacy
+    free+inactive+speculative heuristic on very old macOS (pre-10.9).
+    """
     total_gb = round(total_bytes / (1024**3), 1)
     info = {"total_gb": total_gb, "used_gb": 0, "free_gb": 0, "pct": 0,
-            "swap_total_gb": 0, "swap_used_gb": 0}
+            "swap_total_gb": 0, "swap_used_gb": 0,
+            "app_gb": 0, "wired_gb": 0, "compressed_gb": 0, "cached_gb": 0}
     try:
         vm = subprocess.check_output(["vm_stat"], text=True)
         page_size = 16384  # Apple Silicon default
         m = re.search(r"page size of (\d+)", vm)
         if m:
             page_size = int(m.group(1))
-        fields = {}
+        f = {}
         for line in vm.splitlines():
-            parts = line.split(":")
+            parts = line.split(":", 1)
             if len(parts) == 2:
                 key = parts[0].strip()
-                val = parts[1].strip().rstrip(".")
+                val = parts[1].strip().rstrip(".").replace(",", "")
                 try:
-                    fields[key] = int(val)
+                    f[key] = int(val)
                 except ValueError:
                     pass
-        free_pages = fields.get("Pages free", 0)
-        inactive = fields.get("Pages inactive", 0)
-        speculative = fields.get("Pages speculative", 0)
-        available_bytes = (free_pages + inactive + speculative) * page_size
-        info["free_gb"] = round(available_bytes / (1024**3), 1)
-        info["used_gb"] = round(info["total_gb"] - info["free_gb"], 1)
-        if info["total_gb"] > 0:
-            info["pct"] = int(info["used_gb"] / info["total_gb"] * 100)
+
+        def gb(pages):
+            return round(max(0, pages) * page_size / (1024**3), 1)
+
+        total_pages = total_bytes // page_size if page_size > 0 else 0
+        free        = f.get("Pages free", 0)
+        spec        = f.get("Pages speculative", 0)
+        wired       = f.get("Pages wired down", 0)
+        purge       = f.get("Pages purgeable", 0)
+        inactive    = f.get("Pages inactive", 0)
+        file_backed = f.get("File-backed pages")            # 10.9+
+        anonymous   = f.get("Anonymous pages")              # 10.9+
+        compressed  = f.get("Pages occupied by compressor") # 10.9+
+
+        if total_pages and file_backed is not None:
+            # Formula B (preferred): used = total - reclaimable
+            free_display = free + spec + file_backed + purge
+            used_pages = total_pages - free_display
+        elif total_pages and anonymous is not None and compressed is not None:
+            # Formula A fallback (missing File-backed pages line)
+            app_pages = max(0, anonymous - purge)
+            used_pages = wired + compressed + app_pages
+            free_display = total_pages - used_pages
+        else:
+            # Legacy heuristic (pre-10.9 macOS)
+            free_display = free + inactive + spec
+            used_pages = total_pages - free_display if total_pages else 0
+
+        if total_pages:
+            used_pages = min(max(0, used_pages), total_pages)
+            free_display = min(max(0, free_display), total_pages)
+            info["used_gb"]       = gb(used_pages)
+            info["free_gb"]       = gb(free_display)
+            info["pct"]           = min(100, int(used_pages / total_pages * 100))
+            info["wired_gb"]      = gb(wired)
+            info["compressed_gb"] = gb(compressed or 0)
+            info["app_gb"]        = gb(max(0, (anonymous or 0) - purge))
+            info["cached_gb"]     = gb(file_backed or 0)
     except Exception:
         pass
     try:
@@ -982,6 +1020,25 @@ def main(stdscr, args):
                 else:
                     safe_addstr(stdscr, row + 3, 2, "Swap: inactive",
                                 curses.color_pair(2) | curses.A_DIM)
+
+                # Memory breakdown (row+4): App / Wired / Compressed / Cached
+                breakdown_full = (
+                    f"App {ram['app_gb']}G  Wired {ram['wired_gb']}G  "
+                    f"Comp {ram['compressed_gb']}G  Cache {ram['cached_gb']}G"
+                )
+                breakdown_short = (
+                    f"App {ram['app_gb']}G W {ram['wired_gb']}G "
+                    f"C {ram['compressed_gb']}G"
+                )
+                avail = mem_w - 4
+                if avail >= len(breakdown_full):
+                    line = breakdown_full
+                elif avail >= len(breakdown_short):
+                    line = breakdown_short
+                else:
+                    line = f"App {ram['app_gb']}G  C {ram['compressed_gb']}G"
+                safe_addstr(stdscr, row + 4, 2, line[:avail],
+                            curses.color_pair(2) | curses.A_DIM)
 
                 # Power box
                 throttle = "no" if thermal == "Nominal" else f"YES ({thermal})"
