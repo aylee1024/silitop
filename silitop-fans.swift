@@ -1,6 +1,24 @@
 import Foundation
 import IOKit
 
+// silitop-fans v1
+//
+// Protocol (stdout, line-delimited UTF-8):
+//   silitop-fans v1
+//   STATUS|ok | STATUS|fanless | STATUS|smc_unavailable
+//   FAN<i>|<rpm>|<max_rpm>     (only when STATUS|ok)
+//
+// Exit codes:
+//   0 = STATUS|ok (one or more fans) OR STATUS|fanless (no fans installed)
+//   2 = STATUS|smc_unavailable (AppleSMC could not be opened)
+//   3 = STATUS|fnum_read_failed (AppleSMC open but FNum unreadable)
+//
+// The Python side reads the header to detect version mismatch (returns None
+// for broken-helper case) and the STATUS line to distinguish "no fans
+// installed" from "broken SMC". The prior implementation returned exit 0
+// with empty stdout for all three cases, making them indistinguishable and
+// permanently disabling fan reads after one transient SMC contention.
+
 // ── SMC data structures ─────────────────────────────────────────────
 // Must match the kernel's SMCParamStruct layout exactly.
 
@@ -53,6 +71,16 @@ func fourCharCode(_ s: String) -> UInt32 {
     return result
 }
 
+func fourCharString(_ value: UInt32) -> String {
+    let bytes: [UInt8] = [
+        UInt8((value >> 24) & 0xFF),
+        UInt8((value >> 16) & 0xFF),
+        UInt8((value >>  8) & 0xFF),
+        UInt8( value        & 0xFF),
+    ]
+    return String(bytes: bytes, encoding: .ascii) ?? ""
+}
+
 func openSMC() -> io_connect_t? {
     let service = IOServiceGetMatchingService(
         0, IOServiceMatching("AppleSMC"))
@@ -77,9 +105,10 @@ func readSMCKey(_ conn: io_connect_t, key: UInt32) -> SMCParamStruct? {
         &input, structSize,
         &output, &outputSize)
     guard kr == kIOReturnSuccess else { return nil }
+    let keyInfo = output.keyInfo  // preserve dataType across step 2
 
     // Step 2: read key value (data8 = 5)
-    input.keyInfo = output.keyInfo
+    input.keyInfo = keyInfo
     input.data8 = 5
     output = SMCParamStruct()
     outputSize = structSize
@@ -88,47 +117,94 @@ func readSMCKey(_ conn: io_connect_t, key: UInt32) -> SMCParamStruct? {
         &input, structSize,
         &output, &outputSize)
     guard kr == kIOReturnSuccess else { return nil }
-
+    // Step 2's output frame has a fresh (zeroed) keyInfo; restore the
+    // dataType from step 1 so decodeSMC's switch can dispatch correctly.
+    output.keyInfo = keyInfo
     return output
 }
 
-func bytesToFloat(_ b: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                         UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                         UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                         UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8)) -> Float {
-    var raw = [b.0, b.1, b.2, b.3]
-    var value: Float = 0
-    memcpy(&value, &raw, 4)
-    return value
+// Decode SMC numeric payloads. The previous implementation treated every
+// payload as a 32-bit float, which silently mis-decoded `fpe2` keys
+// (16-bit unsigned, two fractional bits) into ~0 RPM. Now we switch on
+// the dataType returned in step 1 of readSMCKey.
+func decodeSMC(_ frame: SMCParamStruct) -> Double? {
+    let kind = fourCharString(frame.keyInfo.dataType)
+    let bytes = frame.bytes
+    switch kind {
+    case "fpe2":
+        let raw = (UInt16(bytes.0) << 8) | UInt16(bytes.1)
+        return Double(raw) / 4.0
+    case "flt ":
+        var f: Float = 0
+        var buf = [bytes.0, bytes.1, bytes.2, bytes.3]
+        memcpy(&f, &buf, 4)
+        return Double(f)
+    case "ui16":
+        let raw = (UInt16(bytes.0) << 8) | UInt16(bytes.1)
+        return Double(raw)
+    case "ui32":
+        let raw = (UInt32(bytes.0) << 24)
+                | (UInt32(bytes.1) << 16)
+                | (UInt32(bytes.2) <<  8)
+                |  UInt32(bytes.3)
+        return Double(raw)
+    case "ui8 ":
+        return Double(bytes.0)
+    default:
+        return nil
+    }
+}
+
+func emit(_ line: String) {
+    print(line)
 }
 
 // ── Main ────────────────────────────────────────────────────────────
 
-guard let conn = openSMC() else { exit(0) }
+emit("silitop-fans v1")
+
+guard let conn = openSMC() else {
+    emit("STATUS|smc_unavailable")
+    FileHandle.standardError.write("openSMC failed\n".data(using: .utf8)!)
+    exit(2)
+}
 defer { IOServiceClose(conn) }
 
-// Read number of fans
-guard let fnumOut = readSMCKey(conn, key: fourCharCode("FNum")) else { exit(0) }
+guard let fnumOut = readSMCKey(conn, key: fourCharCode("FNum")) else {
+    emit("STATUS|fnum_read_failed")
+    FileHandle.standardError.write("FNum unreadable\n".data(using: .utf8)!)
+    exit(3)
+}
+
 let numFans = Int(fnumOut.bytes.0)
-if numFans == 0 { exit(0) }
+if numFans == 0 {
+    emit("STATUS|fanless")
+    exit(0)
+}
+
+emit("STATUS|ok")
 
 for i in 0..<numFans {
     let acKey = fourCharCode("F\(i)Ac")
     let mxKey = fourCharCode("F\(i)Mx")
 
-    var rpm: Float = 0
-    var maxRpm: Float = 0
-
-    if let out = readSMCKey(conn, key: acKey) {
-        rpm = bytesToFloat(out.bytes)
+    // Both reads must succeed AND decode for the line to be emitted. The
+    // prior implementation defaulted to 0 RPM on read failure (rendered as
+    // "fan off") and fabricated 6500 RPM on max failure; both made silent
+    // misreadings look like measurements.
+    guard let acFrame = readSMCKey(conn, key: acKey),
+          let rpm = decodeSMC(acFrame) else {
+        FileHandle.standardError.write("F\(i)Ac read/decode failed\n".data(using: .utf8)!)
+        continue
     }
-    if let out = readSMCKey(conn, key: mxKey) {
-        maxRpm = bytesToFloat(out.bytes)
+    guard let mxFrame = readSMCKey(conn, key: mxKey),
+          let maxRpm = decodeSMC(mxFrame), maxRpm > 0 else {
+        FileHandle.standardError.write("F\(i)Mx read/decode failed\n".data(using: .utf8)!)
+        continue
+    }
+    if !rpm.isFinite || !maxRpm.isFinite || rpm < 0 {
+        continue
     }
 
-    // Sanity check: skip implausible values
-    if rpm < 0 { rpm = 0 }
-    if maxRpm <= 0 { maxRpm = 6500 }  // fallback max RPM
-
-    print("FAN\(i)|\(String(format: "%.0f", rpm))|\(String(format: "%.0f", maxRpm))")
+    emit("FAN\(i)|\(String(format: "%.0f", rpm))|\(String(format: "%.0f", maxRpm))")
 }

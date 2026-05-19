@@ -240,7 +240,17 @@ def parse_powermetrics(path):
 
 
 def _is_efficiency(name, slow_prefix):
-    return name[0] == slow_prefix
+    """Case-insensitive first-character match.
+
+    M1-M4 system_profiler reports lower-case "performance / efficiency"
+    while powermetrics cluster names start with upper-case "P-" / "E-".
+    The prior == comparison silently misclassified every M1-M4 efficiency
+    cluster as performance because 'E' != 'e'. Empty-name fallback is in
+    extract_cpu (skip cluster); we still guard here defensively.
+    """
+    if not name or not slow_prefix:
+        return False
+    return name[:1].upper() == slow_prefix[:1].upper()
 
 
 def extract_cpu(parsed, soc):
@@ -382,46 +392,124 @@ def _find_helper(name):
     return None
 
 
-def read_hid_temps(helper):
-    """Read temperatures from IOHIDEventSystemClient via silitop-temps helper."""
-    temps = {}
+HELPER_TIMEOUT_SEC = 1.5
+TEMPS_PROTOCOL_HEADER = "silitop-temps v1"
+FANS_PROTOCOL_HEADER = "silitop-fans v1"
+
+
+def _run_helper(helper):
+    """Run a helper subprocess. Return its stdout text, or None on any
+    failure (missing path, subprocess error, timeout, decode error).
+
+    Shorter timeout than the prior 3.0s so a hung helper does not freeze
+    the UI for a full 6s slow-poll cycle (3s temps + 3s fans). 1.5s is
+    well above normal helper latency on M5 Pro (helpers take <50ms).
+    """
     if not helper:
-        return temps
+        return None
     try:
-        out = subprocess.check_output([helper], text=True, timeout=3,
-                                       stderr=subprocess.DEVNULL)
-        for line in out.strip().splitlines():
-            parts = line.split("|", 1)
-            if len(parts) == 2:
-                try:
-                    temps[parts[0]] = float(parts[1])
-                except ValueError:
-                    pass
-    except Exception:
-        pass
+        out = subprocess.check_output(
+            [helper], text=True, encoding="utf-8",
+            stderr=subprocess.PIPE, timeout=HELPER_TIMEOUT_SEC)
+        return out
+    except (subprocess.SubprocessError, OSError, UnicodeDecodeError):
+        return None
+
+
+def read_hid_temps(helper):
+    """Read temperatures from IOHIDEventSystemClient via silitop-temps.
+
+    Three-state return contract:
+      None  - helper broken (missing, crashed, timed out, version mismatch).
+              Caller should keep last-known temps and try again next cycle.
+      {}    - helper succeeded but reported no sensors (e.g., sandboxed env).
+      {...} - sensor_name -> celsius mapping.
+
+    The prior implementation collapsed all three into {} which made the
+    main loop hide the temperature pane indefinitely on a transient failure.
+    """
+    out = _run_helper(helper)
+    if out is None:
+        return None
+    lines = out.splitlines()
+    if not lines or lines[0].strip() != TEMPS_PROTOCOL_HEADER:
+        # Version mismatch or unexpected output -> treat as broken.
+        return None
+    temps = {}
+    for line in lines[1:]:
+        line = line.rstrip()
+        if not line or line.startswith("STATUS|"):
+            continue
+        # Sensor names from the helper are now '|'-escaped (Swift side
+        # replaces literal '|' with '/'), so a single rsplit is safe.
+        parts = line.rsplit("|", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            val = float(parts[1])
+        except ValueError:
+            continue
+        import math
+        if not math.isfinite(val):
+            continue
+        temps[parts[0]] = val
     return temps
 
 
 def read_fan_speeds(helper):
-    """Read fan speeds from SMC via silitop-fans helper."""
+    """Read fan speeds from SMC via silitop-fans helper.
+
+    Three-state return contract (matches read_hid_temps):
+      None  - helper broken (missing, crashed, version mismatch, SMC failure).
+              Caller should keep last_fan_data and try again next cycle.
+              Crucially: this does NOT latch fan_available=False.
+      []    - confirmed-fanless (STATUS|fanless). Latches fan_available=False
+              for the rest of the process lifetime.
+      [...] - per-fan dicts with rpm and max_rpm.
+
+    The audit's HIGH-2 + CRIT-1 fan findings collapse: a transient SMC blip
+    on first poll no longer permanently disables fan reads.
+    """
+    out = _run_helper(helper)
+    if out is None:
+        return None
+    lines = out.splitlines()
+    if not lines or lines[0].strip() != FANS_PROTOCOL_HEADER:
+        return None
     fans = []
-    if not helper:
-        return fans
-    try:
-        out = subprocess.check_output([helper], text=True, timeout=3,
-                                       stderr=subprocess.DEVNULL)
-        for line in out.strip().splitlines():
-            parts = line.split("|")
-            if len(parts) == 3:
-                try:
-                    fans.append({
-                        "rpm": float(parts[1]),
-                        "max_rpm": float(parts[2]),
-                    })
-                except ValueError:
-                    pass
-    except Exception:
-        pass
+    saw_fanless = False
+    saw_ok = False
+    for line in lines[1:]:
+        line = line.rstrip()
+        if not line:
+            continue
+        if line == "STATUS|fanless":
+            saw_fanless = True
+            continue
+        if line == "STATUS|ok":
+            saw_ok = True
+            continue
+        if line.startswith("STATUS|"):
+            # Other STATUS (smc_unavailable, fnum_read_failed) -> broken.
+            return None
+        parts = line.split("|")
+        if len(parts) != 3:
+            continue
+        try:
+            rpm = float(parts[1])
+            max_rpm = float(parts[2])
+        except ValueError:
+            continue
+        import math
+        if not (math.isfinite(rpm) and math.isfinite(max_rpm)
+                and rpm >= 0 and max_rpm > 0):
+            continue
+        fans.append({"rpm": rpm, "max_rpm": max_rpm})
+    if saw_fanless:
+        return []
+    if not saw_ok and not fans:
+        # Header present but no STATUS line and no fans -> broken.
+        return None
     return fans
 
 
@@ -876,9 +964,9 @@ def main(stdscr, args):
 
         last_timestamp = None
         waiting = True
-        fan_available = True   # assume fans exist until first check
-        fan_seen = False       # set True after first successful read
+        fan_available = True   # latches False only on confirmed-fanless
         fan_data = []
+        last_hid_temps = {}    # last successful temps read
         hid_temps = {}
         # Slow-poll cadence in WALLCLOCK seconds; prior code used iteration
         # count which made temperature staleness scale linearly with
@@ -970,13 +1058,26 @@ def main(stdscr, args):
             # `elapsed >= slow_poll_seconds` branch fires.
             now = time.monotonic()
             if now - last_slow_poll_ts >= slow_poll_seconds:
-                hid_temps = read_hid_temps(temps_helper)
+                # Three-state read: None=broken (keep last_hid_temps), {}=empty
+                # (no sensors; rare; still rerender). The prior single-state
+                # contract dropped last-known temps on every transient helper
+                # failure.
+                fresh_temps = read_hid_temps(temps_helper)
+                if fresh_temps is not None:
+                    last_hid_temps = fresh_temps
+                hid_temps = last_hid_temps
                 if fan_available:
-                    fan_data = read_fan_speeds(fans_helper)
-                    if not fan_data and not fan_seen:
+                    fresh_fans = read_fan_speeds(fans_helper)
+                    if fresh_fans is None:
+                        # Helper broken (transient SMC contention, version
+                        # mismatch). Keep last_fan_data; do NOT latch off.
+                        pass
+                    elif fresh_fans == []:
+                        # Confirmed STATUS|fanless from Swift. Latch.
                         fan_available = False
-                    elif fan_data:
-                        fan_seen = True
+                        fan_data = []
+                    else:
+                        fan_data = fresh_fans
                 last_slow_poll_ts = now
             cpu_die, gpu_die, other_temps = classify_temps(hid_temps)
 
@@ -1402,11 +1503,15 @@ def entry():
 
     if args.test_temps:
         temps = read_hid_temps(_find_helper("silitop-temps"))
+        if temps is None:
+            print("silitop-temps helper failed (missing, crashed, or version "
+                  "mismatch). Try: sudo silitop --test-temps", file=sys.stderr)
+            sys.exit(2)
         if not temps:
-            print("No temperature readings. Try: sudo silitop --test-temps")
-        else:
-            for sensor, val in sorted(temps.items()):
-                print(f"  {sensor}: {val:.1f}°C")
+            print("No temperature readings (no sensors found).")
+            sys.exit(0)
+        for sensor, val in sorted(temps.items()):
+            print(f"  {sensor}: {val:.1f}°C")
         sys.exit(0)
 
     if os.geteuid() != 0:
