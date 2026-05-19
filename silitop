@@ -610,21 +610,25 @@ def classify_temps(temps, gpu_die_zones=2):
 
 
 def get_ram_metrics(total_bytes):
-    """Memory accounting matched to Activity Monitor 14+.
+    """Memory accounting matched to Activity Monitor 14+ menu bar.
 
-    Apple's published definition of "Memory Used" in the menu bar / Activity
-    Monitor (macOS 14+) is App Memory + Wired Memory + Compressed Memory.
-    We use Pages active for app memory and Pages occupied by compressor for
-    compressed memory. The prior formula `total - (free + speculative +
-    file_backed + purgeable)` treated all file-backed pages as cache and
-    under-reported used memory by several GiB on workloads with mapped
-    files. Spot check on this M5 Pro host: prior formula reported 21.3 GiB,
-    Activity Monitor 14+ formula reports 27.0 GiB.
+    Apple's "Memory Used" = App Memory + Wired Memory + Compressed Memory.
+
+    App Memory is Anonymous pages (private, non-file-backed). Pages active
+    is the wrong proxy because the active list contains both anonymous AND
+    file-backed pages currently in use; using it counts cached files as app
+    memory. Verified empirically on this M5 Pro host (2026-05-19): AM shows
+    ~39 GiB, anon+wired+comp yields 39.79 GiB, active+wired+comp yields
+    35.72 GiB (under-reports by ~4 GiB).
+
+    Compressed Memory is Pages occupied by compressor (the RAM footprint
+    of compressed data), NOT Pages stored in compressor (the logical
+    pre-compression size).
 
     Returns the metrics dict, or None when:
       - vm_stat subprocess fails (OSError, timeout, nonzero)
-      - vm_stat output is missing any of: Pages active, Pages wired down,
-        Pages occupied by compressor
+      - vm_stat output is missing any of: Anonymous pages, Pages wired
+        down, Pages occupied by compressor
 
     The caller renders an "unavailable" Memory panel rather than presenting
     silent-zero readings as if they were measured.
@@ -652,14 +656,15 @@ def get_ram_metrics(total_bytes):
 
     # Activity Monitor 14+ requires all three counters. Without them we
     # cannot produce a number that matches the menu bar; surface unavailable.
-    required = ("Pages active", "Pages wired down",
+    required = ("Anonymous pages", "Pages wired down",
                 "Pages occupied by compressor")
     if not all(k in f for k in required):
         return None
 
-    active      = f["Pages active"]
+    anonymous   = f["Anonymous pages"]
     wired       = f["Pages wired down"]
     compressed  = f["Pages occupied by compressor"]
+    active      = f.get("Pages active", 0)
     free        = f.get("Pages free", 0)
     spec        = f.get("Pages speculative", 0)
     purge       = f.get("Pages purgeable", 0)
@@ -672,8 +677,12 @@ def get_ram_metrics(total_bytes):
         return None
     total_pages = total_bytes // page_size
 
-    # Activity Monitor 14+ formula: used = App + Wired + Compressed.
-    used_pages = active + wired + compressed
+    # Activity Monitor 14+: used = App + Wired + Compressed.
+    # App Memory = Anonymous (private app pages). Purgeable is included
+    # in anonymous; AM does NOT subtract it (verified 39.79 vs 39.75 GiB
+    # on the M5 Pro audit host: the 47 MiB purgeable difference was below
+    # AM's display rounding, so we leave anonymous as-is).
+    used_pages = anonymous + wired + compressed
     used_pages = min(max(0, used_pages), max(total_pages, 1))
     free_display = max(0, total_pages - used_pages)
     pct = min(100, int(used_pages / total_pages * 100)) if total_pages else 0
@@ -685,7 +694,7 @@ def get_ram_metrics(total_bytes):
         "pct": pct,
         "wired_gb": gb(wired),
         "compressed_gb": gb(compressed),
-        "app_gb": gb(active),
+        "app_gb": gb(anonymous),
         "cached_gb": gb(file_backed),
         "swap_total_gb": 0,
         "swap_used_gb": 0,
