@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 import unittest
@@ -160,10 +161,17 @@ SWAP_USAGE_TEXT = "total = 49152.00M  used = 47547.88M  free = 1604.12M  (encryp
 
 
 def _make_fake_check_output(vm_text, swap_text=SWAP_USAGE_TEXT):
+    """Stub subprocess.check_output. After UNIT F, silitop calls VM_STAT and
+    SYSCTL by absolute path; match on basename so tests stay portable across
+    PATH-poisoning hardening."""
     def fake(args, **kwargs):
-        if args and args[0] == "vm_stat":
+        if args and os.path.basename(args[0]) == "vm_stat":
             return vm_text
-        if args[:2] == ["sysctl", "-n"] and len(args) >= 3 and args[2] == "vm.swapusage":
+        if (args
+                and os.path.basename(args[0]) == "sysctl"
+                and len(args) >= 3
+                and args[1] == "-n"
+                and args[2] == "vm.swapusage"):
             return swap_text
         raise FileNotFoundError(args)
     return fake
@@ -276,7 +284,7 @@ Pages occupied by compressor:          2500000.
         """vm_stat works but sysctl vm.swapusage fails; the RAM panel must
         still render with swap reported as 0 (informational), not None."""
         def partial(args, **kwargs):
-            if args and args[0] == "vm_stat":
+            if args and os.path.basename(args[0]) == "vm_stat":
                 return VM_STAT_M5_PRO_SNAPSHOT
             raise FileNotFoundError(args)
         with mock.patch.object(SILITOP.subprocess, "check_output", side_effect=partial):
