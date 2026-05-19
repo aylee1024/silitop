@@ -283,7 +283,11 @@ def extract_cpu(parsed, soc):
     agg["p_active"] = int(sum(p_active_list) / max(len(p_active_list), 1))
     agg["e_freq"] = max(e_freq_list) if e_freq_list else 0
     agg["p_freq"] = max(p_freq_list) if p_freq_list else 0
-    # Power (millijoules -> joules; divided by interval in main loop to get watts)
+    # Power units: powermetrics reports cpu_energy/gpu_energy/ane_energy as
+    # millijoules accumulated over the sampling interval, and combined_power
+    # as milliwatts (instantaneous-ish). We /1000 here for both:
+    #   *_energy -> joules per interval (caller divides by elapsed seconds)
+    #   combined_power -> watts (already a power; caller does NOT divide)
     agg["cpu_w"] = proc.get("cpu_energy", 0) / 1000
     agg["gpu_w"] = proc.get("gpu_energy", 0) / 1000
     agg["ane_w"] = proc.get("ane_energy", 0) / 1000
@@ -858,6 +862,18 @@ def main(stdscr, args):
             if ts and ts == last_timestamp:
                 time.sleep(0.1)
                 continue
+            # Compute the actual elapsed wallclock between successive plist
+            # samples. Using args.interval is wrong when the loop falls behind
+            # (helper hang, slow render): we would underreport wattage by the
+            # factor we lagged. Falls back to args.interval on the first sample
+            # or when timestamps are missing/non-arithmetic.
+            if last_timestamp is not None and ts is not None:
+                try:
+                    delta_t_s = max((ts - last_timestamp).total_seconds(), 0.001)
+                except (AttributeError, TypeError):
+                    delta_t_s = float(args.interval)
+            else:
+                delta_t_s = float(args.interval)
             last_timestamp = ts
             waiting = False
 
@@ -888,12 +904,16 @@ def main(stdscr, args):
             slow_poll_counter += 1
             cpu_die, gpu_die, other_temps = classify_temps(hid_temps)
 
-            # Power calculations
-            interval_s = args.interval
-            cpu_w = cpu_agg["cpu_w"] / interval_s
-            gpu_w = cpu_agg["gpu_w"] / interval_s
-            ane_w = cpu_agg["ane_w"] / interval_s
-            pkg_w = cpu_agg["package_w"] / interval_s
+            # Power calculations:
+            #   cpu_w/gpu_w/ane_w come out of extract_cpu as joules accumulated
+            #   over the interval -> divide by elapsed seconds for watts.
+            #   package_w is combined_power, already a power in watts -> do NOT
+            #   divide. The prior /interval_s here cut Total wattage by 1/N at
+            #   --interval=N and could report Total < CPU+GPU+ANE.
+            cpu_w = cpu_agg["cpu_w"] / delta_t_s
+            gpu_w = cpu_agg["gpu_w"] / delta_t_s
+            ane_w = cpu_agg["ane_w"] / delta_t_s
+            pkg_w = cpu_agg["package_w"]
 
             cpu_power_hist.append(cpu_w)
             gpu_power_hist.append(gpu_w)
