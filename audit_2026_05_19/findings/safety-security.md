@@ -1,0 +1,39 @@
+# silitop audit — safety-security
+
+## Summary
+The most important issue is unsafe root use of `/tmp`: `silitop` deletes a global `/tmp/silitop_pm*` prefix as root, then hands a predictable, non-exclusively-created path to root `powermetrics` and later opens that path as root. Subprocess shell construction is otherwise mostly disciplined, all calls use argv lists and no `shell=True`, but the runtime still trusts PATH, `/usr/local/bin`, and user-writable install locations in ways that matter for a sudo-run monitor.
+
+## Findings (ranked)
+
+### CRIT-1: Root `/tmp` plist path is predictable, globally deleted, and not exclusively created
+- **Location:** `silitop:129-167`, `silitop:170-195`, `silitop:1169-1172`
+- **Mechanism:** `main()` builds `timecode = str(int(time.time()))` at `silitop:737`, then `run_powermetrics()` deletes every `/tmp/silitop_pm*` as root at `silitop:131-132`. It then uses `/tmp/silitop_pm{timecode}` at `silitop:133` without `mkstemp`, `O_EXCL`, `O_NOFOLLOW`, a PID, or randomness. `powermetrics` writes to that path at `silitop:140-148`, and `parse_powermetrics()` opens the same path by name at `silitop:179`. A stale pre-created symlink before launch is removed by `silitop:131-132`, so the symlink attack is a race after cleanup, not a simple pre-create. A pre-created directory is simpler: `os.remove()` raises before curses starts because `run_powermetrics()` does not catch `OSError` at `silitop:131-132`.
+- **Impact:** Any local user who can write `/tmp` can crash `sudo silitop` by creating a matching directory. Concurrent `silitop` runs can unlink each other’s active plist files or, if started in the same second, read the same path. If an attacker wins the post-cleanup race with a symlink or FIFO, root `powermetrics` and root Python follow attacker-controlled filesystem state. I did not verify `powermetrics` open flags, so root file clobber through a symlink is an assumption, but the root-owned global unlink and directory DoS are directly visible in the Python code.
+- **Repro:** `mkdir /tmp/silitop_pm_block; sudo silitop` should fail during startup at `silitop:131-132`; remove with `rmdir /tmp/silitop_pm_block`. For the race, loop creating `/tmp/silitop_pm$(date +%s)` and `/tmp/silitop_pm$(($(date +%s)+1))` between cleanup and `powermetrics` open.
+- **Fix sketch:** Replace `silitop:131-133` with `tempfile.NamedTemporaryFile(prefix="silitop_pm_", dir="/tmp", delete=False)` or `os.open(..., O_CREAT|O_EXCL|O_NOFOLLOW, 0o600)`, pass only that path to `powermetrics`, and replace `silitop:1169-1172` with cleanup of that one recorded path. Do not glob-delete a shared prefix.
+
+### CRIT-2: Install path and helper resolution can leave root-run code writable by non-root users
+- **Location:** `install.sh:40-46`, `silitop:299-310`, `silitop:319-340`
+- **Mechanism:** The installer uses `sudo cp` and `sudo chmod +x` at `install.sh:41-46`, but never enforces root ownership, group ownership, or a non-writable parent directory. `_find_helper()` trusts the script directory first and `/usr/local/bin/{name}` second at `silitop:299-310`; `read_hid_temps()` and `read_fan_speeds()` execute those helpers at `silitop:319-340`. On this audited host, `/usr/local/bin` is `andrewlee:admin` and group-writable, and `/usr/local/bin/silitop` plus `/usr/local/bin/silitop-temps` are owned by `andrewlee:admin`. That means a writable helper or executable can later be run as root via `sudo silitop`.
+- **Impact:** A non-root user who can write the installed file or its parent directory can replace `silitop`, `silitop-temps`, or `silitop-fans`; the next `sudo silitop` executes that replacement as root. This overlaps the install-script scope, but it directly affects the runtime helper chain.
+- **Repro:** On a host where the install target is writable, replace `/usr/local/bin/silitop-temps` with an executable that prints `id` or writes a marker, then run `sudo silitop --test-temps`. The helper is selected by `_find_helper()` at `silitop:305-309` and executed at `silitop:319`.
+- **Fix sketch:** In `install.sh:41-46`, use `/usr/bin/install -o root -g wheel -m 0755 ...` or follow `cp` with `sudo chown root:wheel` and `sudo chmod 0755`. Also fail installation if `${INSTALL_DIR}` is writable by group or other; `/usr/local/bin` is not a safe root-execution directory on this host.
+
+### HIGH-1: Root subprocesses and the shebang trust PATH
+- **Location:** `silitop:1`, `silitop:50-52`, `silitop:60-62`, `silitop:88-95`, `silitop:101-103`, `silitop:140-148`, `silitop:158-166`, `silitop:411`, `silitop:467`, `silitop:741-742`
+- **Mechanism:** The script starts with `#!/usr/bin/env python3` at `silitop:1`, so the interpreter is PATH-resolved. Every system tool is also invoked by basename: `sysctl`, `system_profiler`, `nice`, `powermetrics`, and `vm_stat`. Python uses `shell=False` by default for these argv lists, but `execvp` still searches PATH for the executable name.
+- **Impact:** If sudo preserves attacker-controlled PATH, allows `SETENV`, or root launches `silitop` with an unsafe PATH, a fake `python3`, `nice`, `powermetrics`, `sysctl`, `system_profiler`, or `vm_stat` runs as root. I could not verify this host’s sudo environment policy because the sandbox blocks `sudo`; the code-level risk is real under permissive sudo configuration.
+- **Repro:** Where sudo permits PATH override: create `/tmp/fakebin/sysctl`, make it executable, then run `sudo env PATH=/tmp/fakebin:/usr/bin:/usr/sbin:/bin:/sbin silitop`. The first `sysctl` call at `silitop:50-52` runs the fake binary as root.
+- **Fix sketch:** Replace basename subprocess argv entries with absolute paths verified on this host: `/usr/sbin/sysctl`, `/usr/sbin/system_profiler`, `/usr/bin/nice`, `/usr/bin/powermetrics`, and `/usr/bin/vm_stat`. For `silitop:1`, either install with a resolved trusted Python path or explicitly document that sudo must use a safe PATH.
+
+## What I verified vs assumed
+- Verified: all `subprocess.*` call sites in `silitop` use argv lists and omit `shell=True` at `silitop:50`, `silitop:60`, `silitop:88`, `silitop:93`, `silitop:101`, `silitop:147`, `silitop:165`, `silitop:319`, `silitop:339`, `silitop:411`, `silitop:467`, and `silitop:741`; `rg` found no `os.system` or `os.popen`.
+- Verified: `/tmp` handling is only the global glob delete, predictable path, root read, and global cleanup at `silitop:131-133`, `silitop:179`, and `silitop:1169-1172`.
+- Verified: helpers run with the same root EUID after the root check at `silitop:1199-1204`; helper paths are resolved at `silitop:299-310` and executed at `silitop:319-340`.
+- Verified: Swift helpers use IOKit APIs and stdout only; I found no subprocess, IPC file, or arbitrary filesystem read in `silitop-temps.swift:1-92` or `silitop-fans.swift:1-134`.
+- Verified: plist parsing is bounded to the last 65,536 bytes at `silitop:184`, uses `plistlib.loads` at `silitop:193`, and local Python 3.14 `plistlib.py:188-201` rejects XML entity declarations.
+- Verified: runtime histories are bounded with `deque(maxlen=...)` at `silitop:747-768`; I did not find unbounded in-memory logs in this scope.
+- Assumed: `powermetrics -o` follows symlinks or truncates the target if an attacker wins the `/tmp` race; I did not run root `powermetrics` in the sandbox.
+- Assumed: PATH poisoning requires sudo or root execution to preserve or accept an unsafe PATH; I could not inspect effective sudo policy from the sandbox.
+- Assumed: `/usr/local/bin` permissions vary by host; on this host it is writable by `andrewlee:admin`, but the install finding applies whenever the install directory or installed files are writable by non-root.
+- Did not look at: parser logical correctness, UI layout correctness, or style. I did not execute destructive repros or live `sudo powermetrics`.
