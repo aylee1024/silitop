@@ -48,33 +48,47 @@ COLOR_SCHEMES = {
 # ── Data Collection ────────────────────────────────────────────────────────────
 
 def get_soc_info():
-    """Detect SoC name, core topology, GPU cores."""
+    """Detect SoC name, core topology, GPU cores.
+
+    Initial values are sentinels (not plausible guesses): a detection failure
+    in every path returns a soc dict with tier_labels_detected=False so the
+    caller can render a "CPU: detection failed" message instead of presenting
+    fabricated 4+4 Super/Perf labels as real hardware.
+    """
     info = {
-        "name": "Apple Silicon",
-        "e_core_count": 4,
-        "p_core_count": 4,
-        "gpu_core_count": "?",
-        # Labels for the two CPU tiers (overridden for M5+)
-        "fast_label": "Super",
-        "slow_label": "Perf",
-        "fast_prefix": "S",
-        "slow_prefix": "P",
+        "name": None,
+        "e_core_count": None,
+        "p_core_count": None,
+        "gpu_core_count": None,
+        "fast_label": "Performance",
+        "slow_label": "Efficiency",
+        "fast_prefix": "P",
+        "slow_prefix": "E",
+        "tier_labels_detected": False,
     }
     try:
         out = subprocess.check_output(
             [SYSCTL, "-n", "machdep.cpu.brand_string"],
             text=True,
         ).strip()
-        info["name"] = out
+        if out:
+            info["name"] = out
     except Exception:
         pass
 
-    # Detect core tier naming from system_profiler
+    # Detect core tier naming and (if sysctl is sandboxed) SoC name from
+    # system_profiler. Audit #15 verified that on the sandboxed audit host
+    # `sysctl machdep.cpu.brand_string` returned "Operation not permitted"
+    # while system_profiler did expose the Chip name; without the Chip:
+    # parse below the M5 Pro silently fell into the base TDP bucket.
     try:
         hw = subprocess.check_output(
             [SYSTEM_PROFILER, "SPHardwareDataType"], text=True, timeout=5
         )
         for line in hw.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Chip:") and info["name"] is None:
+                info["name"] = stripped.split(":", 1)[1].strip()
             if "Total Number of Cores" in line:
                 # e.g. "6 Super and 12 Performance" or "2 Efficiency and 8 Performance"
                 core_desc = line.split(": ", 1)[-1].strip()
@@ -92,20 +106,23 @@ def get_soc_info():
                     info["slow_label"] = slow_type       # "Performance" on M5
                     info["fast_prefix"] = fast_type[0]   # "S"
                     info["slow_prefix"] = slow_type[0]   # "P"
+                    info["tier_labels_detected"] = True
     except Exception:
         pass
 
-    # Fallback to sysctl if system_profiler didn't give us core counts
-    if info["p_core_count"] == 4:
+    # Fallback to sysctl if system_profiler didn't give us core counts.
+    # physicalcpu is the stable topology key; logicalcpu reports the count
+    # currently available under the active power management mode (audit #33).
+    if info["p_core_count"] is None:
         try:
             info["p_core_count"] = int(
                 subprocess.check_output(
-                    [SYSCTL, "-n", "hw.perflevel0.logicalcpu"], text=True
+                    [SYSCTL, "-n", "hw.perflevel0.physicalcpu"], text=True
                 ).strip()
             )
             info["e_core_count"] = int(
                 subprocess.check_output(
-                    [SYSCTL, "-n", "hw.perflevel1.logicalcpu"], text=True
+                    [SYSCTL, "-n", "hw.perflevel1.physicalcpu"], text=True
                 ).strip()
             )
         except Exception:
@@ -122,8 +139,11 @@ def get_soc_info():
                 break
     except Exception:
         pass
-    # TDP estimates
-    name = info["name"]
+    # TDP estimates. info["name"] can still be None at this point (audit #15
+    # case): both sysctl AND system_profiler failed. Match against the empty
+    # string so the substring search falls into the base bucket without
+    # raising. The header rendering treats name=None as "Apple Silicon".
+    name = info["name"] or ""
     if "Ultra" in name:
         info["cpu_max_power"] = 80
         info["gpu_max_power"] = 120
@@ -954,11 +974,18 @@ def main(stdscr, args):
     init_colors(args.color)
 
     soc = get_soc_info()
+    # Build header tolerating None topology fields (sandboxed sysctl,
+    # localized system_profiler, unsupported chip). Display unknowns as "?"
+    # rather than the Python str(None) "None".
+    name = soc["name"] or "Apple Silicon"
+    p = soc["p_core_count"] if soc["p_core_count"] is not None else "?"
+    e = soc["e_core_count"] if soc["e_core_count"] is not None else "?"
+    g = soc["gpu_core_count"] if soc["gpu_core_count"] is not None else "?"
     header = (
-        f"{soc['name']} "
-        f"({soc['p_core_count']}{soc['fast_prefix']}+"
-        f"{soc['e_core_count']}{soc['slow_prefix']}+"
-        f"{soc['gpu_core_count']}GPU)"
+        f"{name} "
+        f"({p}{soc['fast_prefix']}+"
+        f"{e}{soc['slow_prefix']}+"
+        f"{g}GPU)"
     )
 
     # SIGTERM (from launchd, tmux kill-session, sudo timeout, etc.) is
@@ -1178,9 +1205,15 @@ def main(stdscr, args):
             row += 1
 
             # ── CPU Cores Section ──────────────────────────────────────
+            # left/right naming makes no claim about E vs P tier order. M5
+            # ships fast (Super) on left + slow (Performance) on right; M1-M4
+            # may invert. The prior e_box_w/p_box_w names were misleading
+            # because both columns rendered the same width arithmetic; a
+            # future asymmetric tweak would silently flip which tier got the
+            # wider column (audit NEW-HIGH-2).
             half_w = max_w // 2
-            e_box_w = half_w - 1
-            p_box_w = max_w - half_w - 1
+            left_box_w = half_w - 1
+            right_box_w = max_w - half_w - 1
             if cores is None or cpu_agg is None:
                 # Reserve a small unavailable banner; downstream panels still
                 # render so a CPU-extractor failure does not blank the whole UI.
@@ -1202,7 +1235,9 @@ def main(stdscr, args):
 
                 cpu_die_vals = [t for _, t in cpu_die]
                 cpu_die_max = max(cpu_die_vals) if cpu_die_vals else None
-                cpu_temp_str = f"  {cpu_die_max:.0f}°C" if cpu_die_max else ""
+                # `if cpu_die_max` would treat a measured 0.0 °C as missing
+                # and drop the temp from the title; use identity check.
+                cpu_temp_str = f"  {cpu_die_max:.0f}°C" if cpu_die_max is not None else ""
                 fast_title = f"{fast_label}: {cpu_agg['p_active']}% @ {cpu_agg['p_freq']} MHz"
                 slow_title = f"{slow_label}: {cpu_agg['e_active']}% @ {cpu_agg['e_freq']} MHz{cpu_temp_str}"
 
@@ -1216,10 +1251,10 @@ def main(stdscr, args):
                     show_fan_box = fan_data and blank_rows >= 3
 
                     if show_fan_box:
-                        draw_box(stdscr, row, 0, fast_box_h, e_box_w, fast_title)
+                        draw_box(stdscr, row, 0, fast_box_h, left_box_w, fast_title)
                         fans_box_h = blank_rows
                         draw_box(stdscr, row + fast_box_h, 0, fans_box_h,
-                                 e_box_w, "Fans")
+                                 left_box_w, "Fans")
                         for fi, fan in enumerate(fan_data):
                             if fi >= fans_box_h - 2:
                                 break
@@ -1232,24 +1267,24 @@ def main(stdscr, args):
                                 safe_addstr(stdscr, fan_y, 2,
                                             fan_label + "  off",
                                             curses.color_pair(2) | curses.A_DIM,
-                                            clip_right=e_box_w - 1)
+                                            clip_right=left_box_w - 1)
                             else:
                                 draw_fan_row(stdscr, fan_y, 2,
-                                             e_box_w - 4, fan_label, pct, rpm)
+                                             left_box_w - 4, fan_label, pct, rpm)
                     else:
-                        draw_box(stdscr, row, 0, cpu_box_h, e_box_w, fast_title)
+                        draw_box(stdscr, row, 0, cpu_box_h, left_box_w, fast_title)
 
                     # Right column: slow tier box (always full height)
-                    draw_box(stdscr, row, half_w, cpu_box_h, p_box_w, slow_title)
+                    draw_box(stdscr, row, half_w, cpu_box_h, right_box_w, slow_title)
 
                     for i, core in enumerate(p_cores):
                         label = f"{fast_pre}{i+1:<2d}"
-                        draw_core_row(stdscr, row + 1 + i, 2, e_box_w - 4,
+                        draw_core_row(stdscr, row + 1 + i, 2, left_box_w - 4,
                                       label, core["active"], core["freq_mhz"])
 
                     for i, core in enumerate(e_cores):
                         label = f"{slow_pre}{i+1:<2d}"
-                        draw_core_row(stdscr, row + 1 + i, half_w + 2, p_box_w - 4,
+                        draw_core_row(stdscr, row + 1 + i, half_w + 2, right_box_w - 4,
                                       label, core["active"], core["freq_mhz"])
 
                     row += cpu_box_h
@@ -1262,7 +1297,9 @@ def main(stdscr, args):
                 if gpu is None:
                     draw_unavailable_box(stdscr, row, 0, gpu_box_h, max_w, "GPU")
                 else:
-                    gpu_temp_str = f"  {gpu_die_max:.0f}°C" if gpu_die_max else ""
+                    # Identity check (see CPU title above): truthiness drops
+                    # a measured 0.0 °C reading.
+                    gpu_temp_str = f"  {gpu_die_max:.0f}°C" if gpu_die_max is not None else ""
                     gpu_title = f"GPU: {gpu['active']}% @ {gpu['freq_mhz']} MHz{gpu_temp_str}"
                     draw_box(stdscr, row, 0, gpu_box_h, max_w, gpu_title)
                     draw_hbar_full(stdscr, row + 1, 2, max_w - 4, gpu["active"])

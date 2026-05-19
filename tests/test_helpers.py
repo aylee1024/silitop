@@ -10,6 +10,7 @@ Tests stub subprocess.check_output to simulate Swift helper output without
 requiring the real binaries.
 """
 import importlib.util
+import os
 import pathlib
 import subprocess
 import sys
@@ -166,6 +167,49 @@ class FansProtocolTests(unittest.TestCase):
                "FAN2|1900|6500\n")
         result = self._call(stdout=out)
         self.assertEqual(result, [{"rpm": 1900.0, "max_rpm": 6500.0}])
+
+
+class SocInfoFallbackTests(unittest.TestCase):
+    """get_soc_info returns None sentinels (not guessed 4+4 defaults) when
+    every detection path fails, and sets tier_labels_detected accordingly."""
+
+    def test_total_failure_yields_none_topology(self):
+        def boom(args, **kwargs):
+            raise FileNotFoundError(args)
+        with mock.patch.object(SILITOP.subprocess, "check_output",
+                               side_effect=boom):
+            info = SILITOP.get_soc_info()
+        self.assertIsNone(info["name"])
+        self.assertIsNone(info["p_core_count"])
+        self.assertIsNone(info["e_core_count"])
+        self.assertIsNone(info["gpu_core_count"])
+        self.assertFalse(info["tier_labels_detected"])
+        # TDP fallback bucket still populated (base).
+        self.assertEqual(info["cpu_max_power"], 20)
+
+    def test_chip_line_used_when_sysctl_brand_string_fails(self):
+        """Audit #15: on sandboxed hosts sysctl machdep.cpu.brand_string can
+        return "Operation not permitted" while system_profiler still emits
+        the Chip: line. The new fallback picks up Chip: so the M5 Pro lands
+        in the Pro TDP bucket instead of the base bucket."""
+        def fake(args, **kwargs):
+            if args and os.path.basename(args[0]) == "sysctl":
+                # First call: machdep.cpu.brand_string. Raise as if sandboxed.
+                raise subprocess.CalledProcessError(1, args)
+            if args and os.path.basename(args[0]) == "system_profiler":
+                return ("Hardware:\n"
+                        "    Hardware Overview:\n"
+                        "      Chip: Apple M5 Pro\n"
+                        "      Total Number of Cores: 18 (6 Super and 12 Performance)\n")
+            return ""
+        with mock.patch.object(SILITOP.subprocess, "check_output",
+                               side_effect=fake):
+            info = SILITOP.get_soc_info()
+        self.assertEqual(info["name"], "Apple M5 Pro")
+        self.assertEqual(info["cpu_max_power"], 30)  # Pro bucket, not base
+        self.assertEqual(info["p_core_count"], 6)
+        self.assertEqual(info["e_core_count"], 12)
+        self.assertTrue(info["tier_labels_detected"])
 
 
 class IsEfficiencyTests(unittest.TestCase):
