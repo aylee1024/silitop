@@ -13,12 +13,24 @@ import os
 import plistlib
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from collections import deque
+
+# Absolute paths for every root-invoked system tool. Calling these by
+# basename allowed a poisoned PATH (or a misconfigured sudo policy that
+# preserves user PATH) to substitute attacker-controlled binaries into
+# the root subprocess chain (audit #25).
+SYSCTL = "/usr/sbin/sysctl"
+SYSTEM_PROFILER = "/usr/sbin/system_profiler"
+POWERMETRICS = "/usr/bin/powermetrics"
+NICE = "/usr/bin/nice"
+VM_STAT = "/usr/bin/vm_stat"
+SYSTEM_HELPER_DIR = "/usr/local/bin"
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -50,7 +62,7 @@ def get_soc_info():
     }
     try:
         out = subprocess.check_output(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            [SYSCTL, "-n", "machdep.cpu.brand_string"],
             text=True,
         ).strip()
         info["name"] = out
@@ -60,7 +72,7 @@ def get_soc_info():
     # Detect core tier naming from system_profiler
     try:
         hw = subprocess.check_output(
-            ["system_profiler", "SPHardwareDataType"], text=True, timeout=5
+            [SYSTEM_PROFILER, "SPHardwareDataType"], text=True, timeout=5
         )
         for line in hw.splitlines():
             if "Total Number of Cores" in line:
@@ -88,12 +100,12 @@ def get_soc_info():
         try:
             info["p_core_count"] = int(
                 subprocess.check_output(
-                    ["sysctl", "-n", "hw.perflevel0.logicalcpu"], text=True
+                    [SYSCTL, "-n", "hw.perflevel0.logicalcpu"], text=True
                 ).strip()
             )
             info["e_core_count"] = int(
                 subprocess.check_output(
-                    ["sysctl", "-n", "hw.perflevel1.logicalcpu"], text=True
+                    [SYSCTL, "-n", "hw.perflevel1.logicalcpu"], text=True
                 ).strip()
             )
         except Exception:
@@ -101,7 +113,7 @@ def get_soc_info():
     # GPU core count from display profiler
     try:
         sp = subprocess.check_output(
-            ["system_profiler", "-detailLevel", "basic", "SPDisplaysDataType"],
+            [SYSTEM_PROFILER, "-detailLevel", "basic", "SPDisplaysDataType"],
             text=True, timeout=5,
         )
         for line in sp.splitlines():
@@ -143,7 +155,7 @@ def run_powermetrics(pm_path, interval=1000):
     last_stderr = ""
     for samplers in samplers_options:
         cmd = [
-            "nice", "-n", "10", "powermetrics",
+            NICE, "-n", "10", POWERMETRICS,
             "--samplers", samplers,
             "-o", pm_path,
             "-f", "plist",
@@ -379,14 +391,38 @@ def format_rate(bps):
 
 
 def _find_helper(name):
-    """Resolve path to a compiled helper binary (once at startup)."""
+    """Resolve path to a compiled helper binary (once at startup).
+
+    Under sudo (EUID 0), we ONLY trust SYSTEM_HELPER_DIR helpers that are
+    root-owned and not group/world-writable. The prior implementation
+    preferred the directory next to the Python frontend, which made
+    `sudo silitop` happily execute a helper any local user could overwrite
+    (audit #7 / safety-security CRIT-2). Non-root invocations (--test-temps
+    from a developer's checkout) still resolve repo-local helpers for
+    iteration, since they cannot escalate privileges.
+    """
     try:
-        local = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
     except NameError:
-        local = None
+        script_dir = None
+    local = os.path.join(script_dir, name) if script_dir else None
+    system = os.path.join(SYSTEM_HELPER_DIR, name)
+
+    if os.geteuid() == 0:
+        # Root invocation: refuse to execute a helper unless system-owned.
+        try:
+            st = os.stat(system)
+        except FileNotFoundError:
+            return None
+        if (st.st_uid != 0 or
+                (st.st_mode & stat.S_IWGRP) or
+                (st.st_mode & stat.S_IWOTH)):
+            return None
+        return system
+
+    # Non-root: dev mode. Prefer repo-local, fall back to system.
     if local and os.path.isfile(local):
         return local
-    system = f"/usr/local/bin/{name}"
     if os.path.isfile(system):
         return system
     return None
@@ -575,7 +611,7 @@ def get_ram_metrics(total_bytes):
     silent-zero readings as if they were measured.
     """
     try:
-        vm = subprocess.check_output(["vm_stat"], text=True, timeout=2)
+        vm = subprocess.check_output([VM_STAT], text=True, timeout=2)
     except (subprocess.SubprocessError, OSError):
         return None
 
@@ -637,7 +673,7 @@ def get_ram_metrics(total_bytes):
     }
     # Swap is informational; its failure does not void the whole panel.
     try:
-        sw = subprocess.check_output(["sysctl", "-n", "vm.swapusage"],
+        sw = subprocess.check_output([SYSCTL, "-n", "vm.swapusage"],
                                      text=True, timeout=2)
         m_total = re.search(r"total\s*=\s*([\d.]+)M", sw)
         m_used = re.search(r"used\s*=\s*([\d.]+)M", sw)
@@ -941,7 +977,7 @@ def main(stdscr, args):
 
         # One-time lookups
         total_mem_bytes = int(subprocess.check_output(
-            ["sysctl", "-n", "hw.memsize"], text=True).strip())
+            [SYSCTL, "-n", "hw.memsize"], text=True).strip())
         temps_helper = _find_helper("silitop-temps")
         fans_helper = _find_helper("silitop-fans")
 
