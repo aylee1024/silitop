@@ -1129,13 +1129,34 @@ def main(stdscr, args):
                 cores, cpu_agg = None, None
             else:
                 cores, cpu_agg = cpu_result
-                # Freq cache: use last known value when powermetrics reports 0
-                for core in cores["e_cores"] + cores["p_cores"]:
-                    cid = core["id"]
-                    if core["freq_mhz"] > 0:
-                        freq_cache[cid] = core["freq_mhz"]
-                    elif cid in freq_cache:
-                        core["freq_mhz"] = freq_cache[cid]
+                # Freq fallback (audit NEW-MED-1): powermetrics reports
+                # freq_hz=0 for cores at 100% utilization. Three-tier
+                # fallback covers the first frame as well as steady state:
+                #   1. core's own freq_hz (if > 0)
+                #   2. last known freq for this core id
+                #   3. last known max freq for this core's tier
+                # The prior code stopped at tier 2; on the first frame
+                # nothing was cached, so 100%-utilization cores flickered
+                # as 0 MHz.
+                tier_max = {"e_cores": 0, "p_cores": 0}
+                for bucket in ("e_cores", "p_cores"):
+                    for core in cores[bucket]:
+                        if core["freq_mhz"] > 0:
+                            tier_max[bucket] = max(tier_max[bucket], core["freq_mhz"])
+                for bucket in ("e_cores", "p_cores"):
+                    for core in cores[bucket]:
+                        cid = core["id"]
+                        if core["freq_mhz"] > 0:
+                            freq_cache[cid] = core["freq_mhz"]
+                            freq_cache[("tier", bucket)] = max(
+                                freq_cache.get(("tier", bucket), 0),
+                                core["freq_mhz"])
+                        elif cid in freq_cache:
+                            core["freq_mhz"] = freq_cache[cid]
+                        elif tier_max[bucket] > 0:
+                            core["freq_mhz"] = tier_max[bucket]
+                        elif freq_cache.get(("tier", bucket), 0) > 0:
+                            core["freq_mhz"] = freq_cache[("tier", bucket)]
             gpu = extract_gpu(parsed)
             thermal = extract_thermal(parsed)
             net = extract_network(parsed)
