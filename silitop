@@ -800,11 +800,16 @@ def main(stdscr, args):
         temps_helper = _find_helper("silitop-temps")
         fans_helper = _find_helper("silitop-fans")
 
-        # Power history
-        max_history = 120
+        # Power history. We size buffers by WALLCLOCK seconds, not by sample
+        # count: --interval 5 with maxlen=120 used to retain 10 minutes of
+        # history while the sparkline column showed "120 samples", which is
+        # not what the user asked for. Clamp the lower bound so very long
+        # intervals still keep a usable sparkline length.
+        history_seconds = 120
+        max_history = max(30, history_seconds // args.interval)
         cpu_power_hist = deque(maxlen=max_history)
         gpu_power_hist = deque(maxlen=max_history)
-        avg_window = int(args.avg / args.interval)
+        avg_window = max(1, args.avg // args.interval)
         cpu_power_avg = deque(maxlen=avg_window)
         gpu_power_avg = deque(maxlen=avg_window)
         cpu_peak = 0
@@ -818,7 +823,11 @@ def main(stdscr, args):
         fan_seen = False       # set True after first successful read
         fan_data = []
         hid_temps = {}
-        slow_poll_counter = 0  # throttle temps/fans to every 3 cycles
+        # Slow-poll cadence in WALLCLOCK seconds; prior code used iteration
+        # count which made temperature staleness scale linearly with
+        # --interval (3 ticks at --interval 5 = 15 seconds between polls).
+        slow_poll_seconds = 3.0
+        last_slow_poll_ts = 0.0  # monotonic; 0.0 forces first-iteration poll
         net_in_hist = deque(maxlen=max_history)
         net_out_hist = deque(maxlen=max_history)
         disk_r_hist = deque(maxlen=max_history)
@@ -892,8 +901,12 @@ def main(stdscr, args):
             disk = extract_disk(parsed)
             ram = get_ram_metrics(total_mem_bytes)
 
-            # Read temps and fans every 3 cycles (they change slowly)
-            if slow_poll_counter % 3 == 0:
+            # Slow-poll temps and fans on WALLCLOCK seconds (they change
+            # slowly and we don't want temperature staleness to scale with
+            # --interval). first iteration: last_slow_poll_ts == 0 so the
+            # `elapsed >= slow_poll_seconds` branch fires.
+            now = time.monotonic()
+            if now - last_slow_poll_ts >= slow_poll_seconds:
                 hid_temps = read_hid_temps(temps_helper)
                 if fan_available:
                     fan_data = read_fan_speeds(fans_helper)
@@ -901,7 +914,7 @@ def main(stdscr, args):
                         fan_available = False
                     elif fan_data:
                         fan_seen = True
-            slow_poll_counter += 1
+                last_slow_poll_ts = now
             cpu_die, gpu_die, other_temps = classify_temps(hid_temps)
 
             # Power calculations:
@@ -1269,7 +1282,7 @@ def entry():
         description="silitop: Apple Silicon performance monitor with per-core display"
     )
     parser.add_argument("--interval", type=int, default=1,
-                        help="Sampling interval in seconds (default: 1)")
+                        help="Sampling interval in seconds (default: 1; minimum 1)")
     parser.add_argument("--color", type=int, default=2, choices=range(7),
                         help="Color scheme 0-6 (default: 2/green)")
     parser.add_argument("--avg", type=int, default=30,
@@ -1277,6 +1290,14 @@ def entry():
     parser.add_argument("--test-temps", action="store_true",
                         help="Print temperature sensor readings and exit")
     args = parser.parse_args()
+
+    # Validate up front so we never start powermetrics with garbage. The prior
+    # code would launch the child subprocess and then ZeroDivisionError or
+    # ValueError on deque(maxlen=-1), bypassing the finally cleanup.
+    if args.interval < 1:
+        parser.error("--interval must be >= 1 (seconds)")
+    if args.avg < args.interval:
+        parser.error(f"--avg ({args.avg}) must be >= --interval ({args.interval})")
 
     if args.test_temps:
         temps = read_hid_temps(_find_helper("silitop-temps"))
