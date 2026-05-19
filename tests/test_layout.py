@@ -233,22 +233,22 @@ class RamMetricsTests(unittest.TestCase):
             return SILITOP.get_ram_metrics(total_bytes)
 
     def test_m5_pro_snapshot_matches_activity_monitor(self):
-        # Activity Monitor 14+ formula: used = active + wired + compressor.
-        # On this snapshot: 757636 + 364720 + 2250658 = 3,373,014 pages
-        #   * 16384 / 1024**3 = 51.45 GiB
+        # Activity Monitor 14+: used = anonymous + wired + compressor.
+        # On this snapshot: 1348827 + 364720 + 2250658 = 3,964,205 pages
+        #   * 16384 / 1024**3 = 60.45 GiB
         info = self._run(VM_STAT_M5_PRO_SNAPSHOT)
         self.assertEqual(info["total_gb"], 64.0)
-        self.assertGreaterEqual(info["used_gb"], 51.3)
-        self.assertLessEqual(info["used_gb"], 51.6)
-        self.assertGreaterEqual(info["pct"], 80)
-        self.assertLessEqual(info["pct"], 81)
+        self.assertGreaterEqual(info["used_gb"], 60.3)
+        self.assertLessEqual(info["used_gb"], 60.6)
+        self.assertGreaterEqual(info["pct"], 94)
+        self.assertLessEqual(info["pct"], 95)
         # Breakdown:
-        #   app_gb (Pages active): 757636 * 16384 / 1024**3 = 11.56 GiB
-        #   wired_gb:              364720 * 16384 / 1024**3 = 5.56 GiB
-        #   compressed_gb:        2250658 * 16384 / 1024**3 = 34.32 GiB
+        #   app_gb (Anonymous):    1348827 * 16384 / 1024**3 = 20.57 GiB
+        #   wired_gb:               364720 * 16384 / 1024**3 = 5.56 GiB
+        #   compressed_gb:         2250658 * 16384 / 1024**3 = 34.32 GiB
         #   cached_gb (File-backed): 164217 * 16384 / 1024**3 = 2.51 GiB
-        self.assertGreaterEqual(info["app_gb"], 11.4)
-        self.assertLessEqual(info["app_gb"], 11.7)
+        self.assertGreaterEqual(info["app_gb"], 20.4)
+        self.assertLessEqual(info["app_gb"], 20.7)
         self.assertGreaterEqual(info["wired_gb"], 5.5)
         self.assertLessEqual(info["wired_gb"], 5.7)
         self.assertGreaterEqual(info["compressed_gb"], 34.2)
@@ -260,8 +260,8 @@ class RamMetricsTests(unittest.TestCase):
         self.assertGreater(info["swap_used_gb"], 46.0)
 
     def test_low_pressure_idle(self):
-        # 300000 active + 200000 wired + 100000 compressor = 600000 pages
-        #   = 9.4 GiB. On 64 GiB host, ~14.6%.
+        # Used = anonymous(500k) + wired(200k) + compressor(100k) = 800k pages
+        #   * 16384 / 1024**3 = 12.21 GiB. On 64 GiB host, ~19.1%.
         vm_text = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
 Pages free:                            2000000.
 Pages active:                           300000.
@@ -276,9 +276,8 @@ Pages occupied by compressor:           100000.
         info = self._run(vm_text)
         self.assertLess(info["pct"], 30)
         self.assertGreater(info["cached_gb"], 0)
-        # Used = (300 + 200 + 100) * 16384 KiB = 9.4 GiB
-        self.assertGreaterEqual(info["used_gb"], 9.0)
-        self.assertLessEqual(info["used_gb"], 9.5)
+        self.assertGreaterEqual(info["used_gb"], 12.1)
+        self.assertLessEqual(info["used_gb"], 12.3)
 
     def test_returns_none_when_required_counter_missing(self):
         # Missing "Pages occupied by compressor": Activity Monitor 14+ cannot
@@ -291,12 +290,24 @@ Pages inactive:                         400000.
 Pages speculative:                       50000.
 Pages wired down:                       300000.
 Pages purgeable:                             0.
+Anonymous pages:                        500000.
+"""
+        info = self._run(vm_text)
+        self.assertIsNone(info)
+
+    def test_returns_none_when_anonymous_missing(self):
+        # Anonymous is now required: without it we can't compute App Memory.
+        vm_text = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                             100000.
+Pages active:                           500000.
+Pages wired down:                       300000.
+Pages occupied by compressor:           100000.
 """
         info = self._run(vm_text)
         self.assertIsNone(info)
 
     def test_pct_clamped_to_100(self):
-        # Pathological: active+wired+compressor exceeds total.
+        # Pathological: anonymous+wired+compressor exceeds total.
         vm_text = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
 Pages free:                                  0.
 Pages active:                          2000000.
