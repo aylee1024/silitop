@@ -176,16 +176,22 @@ class RamMetricsTests(unittest.TestCase):
             return SILITOP.get_ram_metrics(total_bytes)
 
     def test_m5_pro_snapshot_matches_activity_monitor(self):
+        # Activity Monitor 14+ formula: used = active + wired + compressor.
+        # On this snapshot: 757636 + 364720 + 2250658 = 3,373,014 pages
+        #   * 16384 / 1024**3 = 51.45 GiB
         info = self._run(VM_STAT_M5_PRO_SNAPSHOT)
         self.assertEqual(info["total_gb"], 64.0)
-        # Formula B on snapshot: 61.42 GiB
-        self.assertGreaterEqual(info["used_gb"], 61.3)
-        self.assertLessEqual(info["used_gb"], 61.6)
-        self.assertGreaterEqual(info["pct"], 95)
-        self.assertLessEqual(info["pct"], 96)
-        # Breakdown matches Activity Monitor within rounding
-        self.assertGreaterEqual(info["app_gb"], 20.4)
-        self.assertLessEqual(info["app_gb"], 20.7)
+        self.assertGreaterEqual(info["used_gb"], 51.3)
+        self.assertLessEqual(info["used_gb"], 51.6)
+        self.assertGreaterEqual(info["pct"], 80)
+        self.assertLessEqual(info["pct"], 81)
+        # Breakdown:
+        #   app_gb (Pages active): 757636 * 16384 / 1024**3 = 11.56 GiB
+        #   wired_gb:              364720 * 16384 / 1024**3 = 5.56 GiB
+        #   compressed_gb:        2250658 * 16384 / 1024**3 = 34.32 GiB
+        #   cached_gb (File-backed): 164217 * 16384 / 1024**3 = 2.51 GiB
+        self.assertGreaterEqual(info["app_gb"], 11.4)
+        self.assertLessEqual(info["app_gb"], 11.7)
         self.assertGreaterEqual(info["wired_gb"], 5.5)
         self.assertLessEqual(info["wired_gb"], 5.7)
         self.assertGreaterEqual(info["compressed_gb"], 34.2)
@@ -197,7 +203,8 @@ class RamMetricsTests(unittest.TestCase):
         self.assertGreater(info["swap_used_gb"], 46.0)
 
     def test_low_pressure_idle(self):
-        # Synthetic snapshot: 64 GiB total, ~80% available as free + file-cache
+        # 300000 active + 200000 wired + 100000 compressor = 600000 pages
+        #   = 9.4 GiB. On 64 GiB host, ~14.6%.
         vm_text = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
 Pages free:                            2000000.
 Pages active:                           300000.
@@ -212,28 +219,14 @@ Pages occupied by compressor:           100000.
         info = self._run(vm_text)
         self.assertLess(info["pct"], 30)
         self.assertGreater(info["cached_gb"], 0)
+        # Used = (300 + 200 + 100) * 16384 KiB = 9.4 GiB
+        self.assertGreaterEqual(info["used_gb"], 9.0)
+        self.assertLessEqual(info["used_gb"], 9.5)
 
-    def test_missing_file_backed_falls_back_to_formula_a(self):
-        # Omit File-backed pages; keep Anonymous + compressor
-        vm_text = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
-Pages free:                              10000.
-Pages active:                           500000.
-Pages inactive:                         500000.
-Pages speculative:                        1000.
-Pages wired down:                       300000.
-Pages purgeable:                             0.
-Anonymous pages:                       1000000.
-Pages occupied by compressor:          2000000.
-"""
-        info = self._run(vm_text)
-        # Formula A: used = wired (300k) + compressor (2M) + anon (1M) = 3.3M pages
-        # 3,300,000 * 16384 / 1024**3 ≈ 50.3 GiB
-        self.assertGreaterEqual(info["used_gb"], 50.0)
-        self.assertLessEqual(info["used_gb"], 50.6)
-        self.assertEqual(info["cached_gb"], 0)
-        self.assertGreater(info["app_gb"], 0)
-
-    def test_missing_anonymous_and_file_backed_falls_back_to_legacy(self):
+    def test_returns_none_when_required_counter_missing(self):
+        # Missing "Pages occupied by compressor": Activity Monitor 14+ cannot
+        # be computed without it. Surface None rather than presenting a
+        # guess that won't match the menu bar.
         vm_text = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
 Pages free:                             100000.
 Pages active:                           500000.
@@ -243,32 +236,10 @@ Pages wired down:                       300000.
 Pages purgeable:                             0.
 """
         info = self._run(vm_text)
-        # Legacy: used = total - (free + inactive + spec) = 4194304 - 550000 = 3,644,304 pages
-        # 3,644,304 * 16384 / 1024**3 ≈ 55.6 GiB
-        self.assertGreaterEqual(info["used_gb"], 55.0)
-        self.assertLessEqual(info["used_gb"], 56.1)
-        self.assertEqual(info["cached_gb"], 0)
-        self.assertEqual(info["app_gb"], 0)
-
-    def test_zero_anonymous_does_not_go_negative(self):
-        # Anonymous=0 but purgeable>0 — clamp must keep app_gb at 0
-        vm_text = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
-Pages free:                            1000000.
-Pages active:                          1000000.
-Pages inactive:                         500000.
-Pages speculative:                       50000.
-Pages wired down:                       300000.
-Pages purgeable:                           100.
-File-backed pages:                      500000.
-Anonymous pages:                             0.
-Pages occupied by compressor:           500000.
-"""
-        info = self._run(vm_text)
-        self.assertEqual(info["app_gb"], 0)
-        self.assertGreaterEqual(info["used_gb"], 0)
+        self.assertIsNone(info)
 
     def test_pct_clamped_to_100(self):
-        # Pathological: report essentially nothing as free/cached → used > total possible
+        # Pathological: active+wired+compressor exceeds total.
         vm_text = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
 Pages free:                                  0.
 Pages active:                          2000000.
@@ -290,19 +261,27 @@ Pages occupied by compressor:          2500000.
         self.assertAlmostEqual(info["swap_total_gb"], 2.0, places=1)
         self.assertAlmostEqual(info["swap_used_gb"], 0.5, places=1)
 
-    def test_subprocess_failure_returns_defaults_not_raise(self):
+    def test_subprocess_failure_returns_none(self):
+        """Audit finding #2 (CRIT): vm_stat failure must NOT silently degrade to
+        Memory: 0/64 GB (0%). It must return None so the caller renders an
+        "unavailable" panel. The prior implementation returned a zero-filled
+        dict; that contract is now reversed."""
         def boom(args, **kwargs):
             raise FileNotFoundError(args)
         with mock.patch.object(SILITOP.subprocess, "check_output", side_effect=boom):
             info = SILITOP.get_ram_metrics(TOTAL_BYTES_64)
-        # Total still derived from total_bytes; everything else stays at zero defaults
-        self.assertEqual(info["total_gb"], 64.0)
-        self.assertEqual(info["used_gb"], 0)
-        self.assertEqual(info["pct"], 0)
-        self.assertEqual(info["app_gb"], 0)
-        self.assertEqual(info["wired_gb"], 0)
-        self.assertEqual(info["compressed_gb"], 0)
-        self.assertEqual(info["cached_gb"], 0)
+        self.assertIsNone(info)
+
+    def test_swap_subprocess_failure_does_not_void_panel(self):
+        """vm_stat works but sysctl vm.swapusage fails; the RAM panel must
+        still render with swap reported as 0 (informational), not None."""
+        def partial(args, **kwargs):
+            if args and args[0] == "vm_stat":
+                return VM_STAT_M5_PRO_SNAPSHOT
+            raise FileNotFoundError(args)
+        with mock.patch.object(SILITOP.subprocess, "check_output", side_effect=partial):
+            info = SILITOP.get_ram_metrics(TOTAL_BYTES_64)
+        self.assertIsNotNone(info)
         self.assertEqual(info["swap_total_gb"], 0)
         self.assertEqual(info["swap_used_gb"], 0)
 
