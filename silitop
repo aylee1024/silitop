@@ -244,15 +244,30 @@ def _is_efficiency(name, slow_prefix):
 
 
 def extract_cpu(parsed, soc):
-    """Extract per-core CPU metrics."""
-    proc = parsed.get("processor", {})
-    clusters = proc.get("clusters", [])
+    """Extract per-core CPU metrics.
+
+    Returns (cores_dict, agg_dict) on success or None when a required field
+    is missing. Required: parsed["processor"]["clusters"] and
+    parsed["processor"]["combined_power"]. Missing either is treated as a
+    schema-drift failure so the caller can render "unavailable" rather than
+    presenting silent zeros as live readings.
+    """
+    proc = parsed.get("processor")
+    if not isinstance(proc, dict) or "clusters" not in proc:
+        return None
+    if "combined_power" not in proc:
+        return None
+    clusters = proc["clusters"]
     cores = {"e_cores": [], "p_cores": []}
     agg = {}
     e_active_list, p_active_list = [], []
     e_freq_list, p_freq_list = [], []
     for cluster in clusters:
         name = cluster.get("name", "")
+        if not name:
+            # Skip malformed cluster instead of crashing on name[0] in
+            # _is_efficiency. The remaining clusters still feed the panel.
+            continue
         is_e = _is_efficiency(name, soc["slow_prefix"])
         bucket = "e_cores" if is_e else "p_cores"
         cluster_freq_hz = cluster.get("freq_hz", 0)
@@ -296,8 +311,14 @@ def extract_cpu(parsed, soc):
 
 
 def extract_gpu(parsed):
-    gpu = parsed.get("gpu", {})
-    freq = gpu.get("freq_hz", 0)
+    """Returns {"active": pct, "freq_mhz": mhz} or None when the gpu sampler
+    block is missing/malformed."""
+    gpu = parsed.get("gpu")
+    if not isinstance(gpu, dict):
+        return None
+    if "idle_ratio" not in gpu or "freq_hz" not in gpu:
+        return None
+    freq = gpu["freq_hz"]
     # GPU freq_hz in powermetrics is already in MHz (despite the key name)
     # matching asitop behavior
     if freq > 1e6:
@@ -305,7 +326,7 @@ def extract_gpu(parsed):
     else:
         freq = int(freq)
     return {
-        "active": int((1 - gpu.get("idle_ratio", 1)) * 100),
+        "active": int((1 - gpu["idle_ratio"]) * 100),
         "freq_mhz": freq,
     }
 
@@ -315,21 +336,25 @@ def extract_thermal(parsed):
 
 
 def extract_network(parsed):
-    """Extract network throughput rates (bytes/sec) from the network sampler."""
-    net = parsed.get("network", {})
-    return {
-        "in_rate": net.get("ibyte_rate", 0),
-        "out_rate": net.get("obyte_rate", 0),
-    }
+    """Returns {"in_rate", "out_rate"} bytes/sec, or None when the network
+    sampler block is missing/malformed."""
+    net = parsed.get("network")
+    if not isinstance(net, dict):
+        return None
+    if "ibyte_rate" not in net or "obyte_rate" not in net:
+        return None
+    return {"in_rate": net["ibyte_rate"], "out_rate": net["obyte_rate"]}
 
 
 def extract_disk(parsed):
-    """Extract disk throughput rates (bytes/sec) from the disk sampler."""
-    dsk = parsed.get("disk", {})
-    return {
-        "read_rate": dsk.get("rbytes_per_s", 0),
-        "write_rate": dsk.get("wbytes_per_s", 0),
-    }
+    """Returns {"read_rate", "write_rate"} bytes/sec, or None when the disk
+    sampler block is missing/malformed."""
+    dsk = parsed.get("disk")
+    if not isinstance(dsk, dict):
+        return None
+    if "rbytes_per_s" not in dsk or "wbytes_per_s" not in dsk:
+        return None
+    return {"read_rate": dsk["rbytes_per_s"], "write_rate": dsk["wbytes_per_s"]}
 
 
 def format_rate(bps):
@@ -442,83 +467,97 @@ def classify_temps(temps, gpu_die_zones=2):
 
 
 def get_ram_metrics(total_bytes):
-    """Get RAM usage without psutil.  total_bytes is cached hw.memsize.
+    """Memory accounting matched to Activity Monitor 14+.
 
-    Uses Activity Monitor-style accounting on macOS:
-      used = total - (free + speculative + file_backed + purgeable)
-    Falls back to (wired + compressor + anonymous - purgeable) when
-    File-backed pages is unavailable, and finally to the legacy
-    free+inactive+speculative heuristic on very old macOS (pre-10.9).
+    Apple's published definition of "Memory Used" in the menu bar / Activity
+    Monitor (macOS 14+) is App Memory + Wired Memory + Compressed Memory.
+    We use Pages active for app memory and Pages occupied by compressor for
+    compressed memory. The prior formula `total - (free + speculative +
+    file_backed + purgeable)` treated all file-backed pages as cache and
+    under-reported used memory by several GiB on workloads with mapped
+    files. Spot check on this M5 Pro host: prior formula reported 21.3 GiB,
+    Activity Monitor 14+ formula reports 27.0 GiB.
+
+    Returns the metrics dict, or None when:
+      - vm_stat subprocess fails (OSError, timeout, nonzero)
+      - vm_stat output is missing any of: Pages active, Pages wired down,
+        Pages occupied by compressor
+
+    The caller renders an "unavailable" Memory panel rather than presenting
+    silent-zero readings as if they were measured.
     """
-    total_gb = round(total_bytes / (1024**3), 1)
-    info = {"total_gb": total_gb, "used_gb": 0, "free_gb": 0, "pct": 0,
-            "swap_total_gb": 0, "swap_used_gb": 0,
-            "app_gb": 0, "wired_gb": 0, "compressed_gb": 0, "cached_gb": 0}
     try:
-        vm = subprocess.check_output(["vm_stat"], text=True)
-        page_size = 16384  # Apple Silicon default
-        m = re.search(r"page size of (\d+)", vm)
-        if m:
-            page_size = int(m.group(1))
-        f = {}
-        for line in vm.splitlines():
-            parts = line.split(":", 1)
-            if len(parts) == 2:
-                key = parts[0].strip()
-                val = parts[1].strip().rstrip(".").replace(",", "")
-                try:
-                    f[key] = int(val)
-                except ValueError:
-                    pass
+        vm = subprocess.check_output(["vm_stat"], text=True, timeout=2)
+    except (subprocess.SubprocessError, OSError):
+        return None
 
-        def gb(pages):
-            return round(max(0, pages) * page_size / (1024**3), 1)
+    page_size = 16384  # Apple Silicon default
+    m = re.search(r"page size of (\d+)", vm)
+    if m:
+        page_size = int(m.group(1))
 
-        total_pages = total_bytes // page_size if page_size > 0 else 0
-        free        = f.get("Pages free", 0)
-        spec        = f.get("Pages speculative", 0)
-        wired       = f.get("Pages wired down", 0)
-        purge       = f.get("Pages purgeable", 0)
-        inactive    = f.get("Pages inactive", 0)
-        file_backed = f.get("File-backed pages")            # 10.9+
-        anonymous   = f.get("Anonymous pages")              # 10.9+
-        compressed  = f.get("Pages occupied by compressor") # 10.9+
+    f = {}
+    for line in vm.splitlines():
+        parts = line.split(":", 1)
+        if len(parts) == 2:
+            key = parts[0].strip()
+            val = parts[1].strip().rstrip(".").replace(",", "")
+            try:
+                f[key] = int(val)
+            except ValueError:
+                pass
 
-        if total_pages and file_backed is not None:
-            # Formula B (preferred): used = total - reclaimable
-            free_display = free + spec + file_backed + purge
-            used_pages = total_pages - free_display
-        elif total_pages and anonymous is not None and compressed is not None:
-            # Formula A fallback (missing File-backed pages line)
-            app_pages = max(0, anonymous - purge)
-            used_pages = wired + compressed + app_pages
-            free_display = total_pages - used_pages
-        else:
-            # Legacy heuristic (pre-10.9 macOS)
-            free_display = free + inactive + spec
-            used_pages = total_pages - free_display if total_pages else 0
+    # Activity Monitor 14+ requires all three counters. Without them we
+    # cannot produce a number that matches the menu bar; surface unavailable.
+    required = ("Pages active", "Pages wired down",
+                "Pages occupied by compressor")
+    if not all(k in f for k in required):
+        return None
 
-        if total_pages:
-            used_pages = min(max(0, used_pages), total_pages)
-            free_display = min(max(0, free_display), total_pages)
-            info["used_gb"]       = gb(used_pages)
-            info["free_gb"]       = gb(free_display)
-            info["pct"]           = min(100, int(used_pages / total_pages * 100))
-            info["wired_gb"]      = gb(wired)
-            info["compressed_gb"] = gb(compressed or 0)
-            info["app_gb"]        = gb(max(0, (anonymous or 0) - purge))
-            info["cached_gb"]     = gb(file_backed or 0)
-    except Exception:
-        pass
+    active      = f["Pages active"]
+    wired       = f["Pages wired down"]
+    compressed  = f["Pages occupied by compressor"]
+    free        = f.get("Pages free", 0)
+    spec        = f.get("Pages speculative", 0)
+    purge       = f.get("Pages purgeable", 0)
+    file_backed = f.get("File-backed pages", 0)
+
+    def gb(pages):
+        return round(max(0, pages) * page_size / (1024**3), 1)
+
+    if page_size <= 0:
+        return None
+    total_pages = total_bytes // page_size
+
+    # Activity Monitor 14+ formula: used = App + Wired + Compressed.
+    used_pages = active + wired + compressed
+    used_pages = min(max(0, used_pages), max(total_pages, 1))
+    free_display = max(0, total_pages - used_pages)
+    pct = min(100, int(used_pages / total_pages * 100)) if total_pages else 0
+
+    info = {
+        "total_gb": round(total_bytes / (1024**3), 1),
+        "used_gb": gb(used_pages),
+        "free_gb": gb(free_display),
+        "pct": pct,
+        "wired_gb": gb(wired),
+        "compressed_gb": gb(compressed),
+        "app_gb": gb(active),
+        "cached_gb": gb(file_backed),
+        "swap_total_gb": 0,
+        "swap_used_gb": 0,
+    }
+    # Swap is informational; its failure does not void the whole panel.
     try:
-        sw = subprocess.check_output(["sysctl", "-n", "vm.swapusage"], text=True)
+        sw = subprocess.check_output(["sysctl", "-n", "vm.swapusage"],
+                                     text=True, timeout=2)
         m_total = re.search(r"total\s*=\s*([\d.]+)M", sw)
         m_used = re.search(r"used\s*=\s*([\d.]+)M", sw)
         if m_total:
             info["swap_total_gb"] = round(float(m_total.group(1)) / 1024, 1)
         if m_used:
             info["swap_used_gb"] = round(float(m_used.group(1)) / 1024, 1)
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         pass
     return info
 
@@ -612,6 +651,24 @@ def draw_box(win, y, x, h, w, title="", color_pair=7):
             pass
     except curses.error:
         pass
+
+
+def draw_unavailable_box(win, y, x, h, w, title):
+    """Draw a titled box reading "data unavailable" in dim warning color.
+
+    Used when a collector (extract_cpu, extract_gpu, get_ram_metrics, ...)
+    returns None to signal that the data source failed or schema-drifted.
+    The user sees a clear "unavailable" rather than a silent zero.
+    """
+    draw_box(win, y, x, h, w, title)
+    if h >= 2 and w >= 6:
+        msg = "data unavailable"
+        if len(msg) > w - 4:
+            msg = "unavailable"
+        mid = y + max(1, h // 2)
+        col = x + max(1, (w - len(msg)) // 2)
+        safe_addstr(win, mid, col, msg,
+                    curses.color_pair(3) | curses.A_DIM, clip_right=x + w - 1)
 
 
 def safe_addstr(win, y, x, s, attr=0, clip_right=None):
@@ -886,15 +943,21 @@ def main(stdscr, args):
             last_timestamp = ts
             waiting = False
 
-            # Extract metrics
-            cores, cpu_agg = extract_cpu(parsed, soc)
-            # Freq cache: use last known value when powermetrics reports 0
-            for core in cores["e_cores"] + cores["p_cores"]:
-                cid = core["id"]
-                if core["freq_mhz"] > 0:
-                    freq_cache[cid] = core["freq_mhz"]
-                elif cid in freq_cache:
-                    core["freq_mhz"] = freq_cache[cid]
+            # Extract metrics. Any of these can return None on schema drift or
+            # subprocess failure; downstream code handles None by rendering an
+            # "unavailable" panel instead of propagating zeros.
+            cpu_result = extract_cpu(parsed, soc)
+            if cpu_result is None:
+                cores, cpu_agg = None, None
+            else:
+                cores, cpu_agg = cpu_result
+                # Freq cache: use last known value when powermetrics reports 0
+                for core in cores["e_cores"] + cores["p_cores"]:
+                    cid = core["id"]
+                    if core["freq_mhz"] > 0:
+                        freq_cache[cid] = core["freq_mhz"]
+                    elif cid in freq_cache:
+                        core["freq_mhz"] = freq_cache[cid]
             gpu = extract_gpu(parsed)
             thermal = extract_thermal(parsed)
             net = extract_network(parsed)
@@ -923,28 +986,42 @@ def main(stdscr, args):
             #   package_w is combined_power, already a power in watts -> do NOT
             #   divide. The prior /interval_s here cut Total wattage by 1/N at
             #   --interval=N and could report Total < CPU+GPU+ANE.
-            cpu_w = cpu_agg["cpu_w"] / delta_t_s
-            gpu_w = cpu_agg["gpu_w"] / delta_t_s
-            ane_w = cpu_agg["ane_w"] / delta_t_s
-            pkg_w = cpu_agg["package_w"]
+            # When the CPU panel is unavailable we leave the wattage variables
+            # at None; the render side gates the Power panel on cpu_w is not
+            # None so it never formats None with :.1f.
+            if cpu_agg is not None:
+                cpu_w = cpu_agg["cpu_w"] / delta_t_s
+                gpu_w = cpu_agg["gpu_w"] / delta_t_s
+                ane_w = cpu_agg["ane_w"] / delta_t_s
+                pkg_w = cpu_agg["package_w"]
+                cpu_power_hist.append(cpu_w)
+                gpu_power_hist.append(gpu_w)
+                cpu_power_avg.append(cpu_w)
+                gpu_power_avg.append(gpu_w)
+                cpu_peak = max(cpu_peak, cpu_w)
+                gpu_peak = max(gpu_peak, gpu_w)
+                pkg_peak = max(pkg_peak, pkg_w)
+            else:
+                cpu_w = gpu_w = ane_w = pkg_w = None
 
-            cpu_power_hist.append(cpu_w)
-            gpu_power_hist.append(gpu_w)
-            cpu_power_avg.append(cpu_w)
-            gpu_power_avg.append(gpu_w)
-            cpu_peak = max(cpu_peak, cpu_w)
-            gpu_peak = max(gpu_peak, gpu_w)
-            pkg_peak = max(pkg_peak, pkg_w)
-
-            # Network + disk rates (already bytes/sec from powermetrics)
-            net_in_rate = net["in_rate"]
-            net_out_rate = net["out_rate"]
-            disk_r_rate = disk["read_rate"]
-            disk_w_rate = disk["write_rate"]
-            net_in_hist.append(net_in_rate)
-            net_out_hist.append(net_out_rate)
-            disk_r_hist.append(disk_r_rate)
-            disk_w_hist.append(disk_w_rate)
+            # Network + disk rates (already bytes/sec from powermetrics).
+            # We do NOT append None into the sparkline deques: drawing logic
+            # assumes numeric values throughout the history. A failed sample
+            # is dropped from the sparkline, not coerced to zero.
+            if net is not None:
+                net_in_rate = net["in_rate"]
+                net_out_rate = net["out_rate"]
+                net_in_hist.append(net_in_rate)
+                net_out_hist.append(net_out_rate)
+            else:
+                net_in_rate = net_out_rate = None
+            if disk is not None:
+                disk_r_rate = disk["read_rate"]
+                disk_w_rate = disk["write_rate"]
+                disk_r_hist.append(disk_r_rate)
+                disk_w_hist.append(disk_w_rate)
+            else:
+                disk_r_rate = disk_w_rate = None
 
             # ── Draw UI ────────────────────────────────────────────────
             stdscr.erase()
@@ -964,95 +1041,106 @@ def main(stdscr, args):
             row += 1
 
             # ── CPU Cores Section ──────────────────────────────────────
-            e_cores = cores["e_cores"]
-            p_cores = cores["p_cores"]
-            e_count = len(e_cores)
-            p_count = len(p_cores)
-            # Determine layout
             half_w = max_w // 2
             e_box_w = half_w - 1
             p_box_w = max_w - half_w - 1
+            if cores is None or cpu_agg is None:
+                # Reserve a small unavailable banner; downstream panels still
+                # render so a CPU-extractor failure does not blank the whole UI.
+                cpu_box_h = 4
+                if row + cpu_box_h < max_h:
+                    draw_unavailable_box(stdscr, row, 0, cpu_box_h, max_w, "CPU")
+                    row += cpu_box_h
+            else:
+                e_cores = cores["e_cores"]
+                p_cores = cores["p_cores"]
+                e_count = len(e_cores)
+                p_count = len(p_cores)
 
-            # e_cores = slow tier (M-prefix / E-prefix), p_cores = fast tier (P-prefix)
-            slow_label = soc["slow_label"]
-            fast_label = soc["fast_label"]
-            slow_pre = soc["slow_prefix"]
-            fast_pre = soc["fast_prefix"]
+                # e_cores = slow tier (M-prefix / E-prefix), p_cores = fast tier
+                slow_label = soc["slow_label"]
+                fast_label = soc["fast_label"]
+                slow_pre = soc["slow_prefix"]
+                fast_pre = soc["fast_prefix"]
 
-            # Fast cores on the left (fewer, so they get the shorter column)
-            # Slow cores on the right (more cores)
-            cpu_die_vals = [t for _, t in cpu_die]
-            cpu_die_max = max(cpu_die_vals) if cpu_die_vals else None
-            cpu_temp_str = f"  {cpu_die_max:.0f}°C" if cpu_die_max else ""
-            fast_title = f"{fast_label}: {cpu_agg['p_active']}% @ {cpu_agg['p_freq']} MHz"
-            slow_title = f"{slow_label}: {cpu_agg['e_active']}% @ {cpu_agg['e_freq']} MHz{cpu_temp_str}"
+                cpu_die_vals = [t for _, t in cpu_die]
+                cpu_die_max = max(cpu_die_vals) if cpu_die_vals else None
+                cpu_temp_str = f"  {cpu_die_max:.0f}°C" if cpu_die_max else ""
+                fast_title = f"{fast_label}: {cpu_agg['p_active']}% @ {cpu_agg['p_freq']} MHz"
+                slow_title = f"{slow_label}: {cpu_agg['e_active']}% @ {cpu_agg['e_freq']} MHz{cpu_temp_str}"
 
-            fast_box_h = p_count + 2
-            slow_box_h = e_count + 2
-            cpu_box_h = max(fast_box_h, slow_box_h)
+                fast_box_h = p_count + 2
+                slow_box_h = e_count + 2
+                cpu_box_h = max(fast_box_h, slow_box_h)
 
-            if row + cpu_box_h < max_h:
-                # Left column: Super box + optional Fans box below
-                blank_rows = cpu_box_h - fast_box_h
-                show_fan_box = fan_data and blank_rows >= 3
+                if row + cpu_box_h < max_h:
+                    # Left column: fast tier box + optional Fans box below
+                    blank_rows = cpu_box_h - fast_box_h
+                    show_fan_box = fan_data and blank_rows >= 3
 
-                if show_fan_box:
-                    draw_box(stdscr, row, 0, fast_box_h, e_box_w, fast_title)
-                    fans_box_h = blank_rows
-                    draw_box(stdscr, row + fast_box_h, 0, fans_box_h,
-                             e_box_w, "Fans")
-                    for fi, fan in enumerate(fan_data):
-                        if fi >= fans_box_h - 2:
-                            break
-                        rpm = fan["rpm"]
-                        max_rpm = fan["max_rpm"]
-                        pct = int(rpm / max_rpm * 100) if max_rpm > 0 else 0
-                        fan_label = f"F{fi+1:<2d}"
-                        fan_y = row + fast_box_h + 1 + fi
-                        if rpm == 0:
-                            safe_addstr(stdscr, fan_y, 2,
-                                        fan_label + "  off",
-                                        curses.color_pair(2) | curses.A_DIM,
-                                        clip_right=e_box_w - 1)
-                        else:
-                            draw_fan_row(stdscr, fan_y, 2,
-                                         e_box_w - 4, fan_label, pct, rpm)
-                else:
-                    draw_box(stdscr, row, 0, cpu_box_h, e_box_w, fast_title)
+                    if show_fan_box:
+                        draw_box(stdscr, row, 0, fast_box_h, e_box_w, fast_title)
+                        fans_box_h = blank_rows
+                        draw_box(stdscr, row + fast_box_h, 0, fans_box_h,
+                                 e_box_w, "Fans")
+                        for fi, fan in enumerate(fan_data):
+                            if fi >= fans_box_h - 2:
+                                break
+                            rpm = fan["rpm"]
+                            max_rpm = fan["max_rpm"]
+                            pct = int(rpm / max_rpm * 100) if max_rpm > 0 else 0
+                            fan_label = f"F{fi+1:<2d}"
+                            fan_y = row + fast_box_h + 1 + fi
+                            if rpm == 0:
+                                safe_addstr(stdscr, fan_y, 2,
+                                            fan_label + "  off",
+                                            curses.color_pair(2) | curses.A_DIM,
+                                            clip_right=e_box_w - 1)
+                            else:
+                                draw_fan_row(stdscr, fan_y, 2,
+                                             e_box_w - 4, fan_label, pct, rpm)
+                    else:
+                        draw_box(stdscr, row, 0, cpu_box_h, e_box_w, fast_title)
 
-                # Right column: Performance box (always full height)
-                draw_box(stdscr, row, half_w, cpu_box_h, p_box_w, slow_title)
+                    # Right column: slow tier box (always full height)
+                    draw_box(stdscr, row, half_w, cpu_box_h, p_box_w, slow_title)
 
-                for i, core in enumerate(p_cores):
-                    label = f"{fast_pre}{i+1:<2d}"
-                    draw_core_row(stdscr, row + 1 + i, 2, e_box_w - 4,
-                                  label, core["active"], core["freq_mhz"])
+                    for i, core in enumerate(p_cores):
+                        label = f"{fast_pre}{i+1:<2d}"
+                        draw_core_row(stdscr, row + 1 + i, 2, e_box_w - 4,
+                                      label, core["active"], core["freq_mhz"])
 
-                for i, core in enumerate(e_cores):
-                    label = f"{slow_pre}{i+1:<2d}"
-                    draw_core_row(stdscr, row + 1 + i, half_w + 2, p_box_w - 4,
-                                  label, core["active"], core["freq_mhz"])
+                    for i, core in enumerate(e_cores):
+                        label = f"{slow_pre}{i+1:<2d}"
+                        draw_core_row(stdscr, row + 1 + i, half_w + 2, p_box_w - 4,
+                                      label, core["active"], core["freq_mhz"])
 
-                row += cpu_box_h
+                    row += cpu_box_h
 
             # ── GPU Section ────────────────────────────────────────────
             gpu_box_h = 3
             gpu_die_vals = [t for _, t in gpu_die]
             gpu_die_max = max(gpu_die_vals) if gpu_die_vals else None
             if row + gpu_box_h < max_h:
-                gpu_temp_str = f"  {gpu_die_max:.0f}°C" if gpu_die_max else ""
-                gpu_title = f"GPU: {gpu['active']}% @ {gpu['freq_mhz']} MHz{gpu_temp_str}"
-                draw_box(stdscr, row, 0, gpu_box_h, max_w, gpu_title)
-                draw_hbar_full(stdscr, row + 1, 2, max_w - 4, gpu["active"])
+                if gpu is None:
+                    draw_unavailable_box(stdscr, row, 0, gpu_box_h, max_w, "GPU")
+                else:
+                    gpu_temp_str = f"  {gpu_die_max:.0f}°C" if gpu_die_max else ""
+                    gpu_title = f"GPU: {gpu['active']}% @ {gpu['freq_mhz']} MHz{gpu_temp_str}"
+                    draw_box(stdscr, row, 0, gpu_box_h, max_w, gpu_title)
+                    draw_hbar_full(stdscr, row + 1, 2, max_w - 4, gpu["active"])
                 row += gpu_box_h
 
             # ── ANE Section ────────────────────────────────────────────
-            ane_pct = min(int(ane_w / soc["ane_max_power"] * 100), 100)
             ane_box_h = 3
             if row + ane_box_h < max_h:
-                ane_title = f"ANE: {ane_pct}% @ {ane_w:.1f}W"
-                draw_box(stdscr, row, 0, ane_box_h, max_w, ane_title)
-                draw_hbar_full(stdscr, row + 1, 2, max_w - 4, ane_pct, color_pair=5)
+                if ane_w is None:
+                    draw_unavailable_box(stdscr, row, 0, ane_box_h, max_w, "ANE")
+                else:
+                    ane_pct = min(int(ane_w / soc["ane_max_power"] * 100), 100)
+                    ane_title = f"ANE: {ane_pct}% @ {ane_w:.1f}W"
+                    draw_box(stdscr, row, 0, ane_box_h, max_w, ane_title)
+                    draw_hbar_full(stdscr, row + 1, 2, max_w - 4, ane_pct, color_pair=5)
                 row += ane_box_h
 
             # ── Network + Disk (side by side) ─────────────────────────
@@ -1060,15 +1148,21 @@ def main(stdscr, args):
             if row + nd_h < max_h:
                 net_w = half_w - 1
                 disk_w = max_w - half_w - 1
-                net_title = (f"Net: \u2193{format_rate(net_in_rate)} "
-                             f"\u2191{format_rate(net_out_rate)}")
-                disk_title = (f"Disk: R {format_rate(disk_r_rate)} "
-                              f"W {format_rate(disk_w_rate)}")
-                draw_box(stdscr, row, 0, nd_h, net_w, net_title)
-                draw_box(stdscr, row, half_w, nd_h, disk_w, disk_title)
+                if net is None:
+                    draw_unavailable_box(stdscr, row, 0, nd_h, net_w, "Net")
+                else:
+                    net_title = (f"Net: \u2193{format_rate(net_in_rate)} "
+                                 f"\u2191{format_rate(net_out_rate)}")
+                    draw_box(stdscr, row, 0, nd_h, net_w, net_title)
+                if disk is None:
+                    draw_unavailable_box(stdscr, row, half_w, nd_h, disk_w, "Disk")
+                else:
+                    disk_title = (f"Disk: R {format_rate(disk_r_rate)} "
+                                  f"W {format_rate(disk_w_rate)}")
+                    draw_box(stdscr, row, half_w, nd_h, disk_w, disk_title)
 
                 spark_avail = net_w - 4
-                if spark_avail > 10 and len(net_in_hist) > 1:
+                if net is not None and spark_avail > 10 and len(net_in_hist) > 1:
                     hw = spark_avail // 2
                     net_in_max = max(max(net_in_hist), 1)
                     net_out_max = max(max(net_out_hist), 1)
@@ -1082,7 +1176,7 @@ def main(stdscr, args):
                                net_out_hist, net_out_max, color_pair=4)
 
                 dsk_avail = disk_w - 4
-                if dsk_avail > 10 and len(disk_r_hist) > 1:
+                if disk is not None and dsk_avail > 10 and len(disk_r_hist) > 1:
                     hw = dsk_avail // 2
                     disk_r_max = max(max(disk_r_hist), 1)
                     disk_w_max = max(max(disk_w_hist), 1)
@@ -1105,64 +1199,71 @@ def main(stdscr, args):
             pow_w = max_w - half_w - 1
             mp_h = 7
             if row + mp_h < max_h:
-                # Memory box
-                ram_title = f"Memory: {ram['used_gb']}/{ram['total_gb']} GB ({ram['pct']}%)"
-                draw_box(stdscr, row, 0, mp_h, mem_w, "Memory")
-                safe_addstr(stdscr, row + 1, 2,
-                            f"RAM: {ram['used_gb']}/{ram['total_gb']} GB ({ram['pct']}%)",
-                            curses.color_pair(2))
-                draw_hbar_full(stdscr, row + 2, 2, mem_w - 4, ram["pct"], color_pair=6)
-                if ram["swap_total_gb"] > 0.05:
-                    safe_addstr(stdscr, row + 3, 2,
-                                f"Swap: {ram['swap_used_gb']}/{ram['swap_total_gb']} GB",
-                                curses.color_pair(2))
+                # Memory box - gated separately from Power so each can be
+                # independently unavailable.
+                if ram is None:
+                    draw_unavailable_box(stdscr, row, 0, mp_h, mem_w, "Memory")
                 else:
-                    safe_addstr(stdscr, row + 3, 2, "Swap: inactive",
+                    draw_box(stdscr, row, 0, mp_h, mem_w, "Memory")
+                    safe_addstr(stdscr, row + 1, 2,
+                                f"RAM: {ram['used_gb']}/{ram['total_gb']} GB ({ram['pct']}%)",
+                                curses.color_pair(2))
+                    draw_hbar_full(stdscr, row + 2, 2, mem_w - 4, ram["pct"], color_pair=6)
+                    if ram["swap_total_gb"] > 0.05:
+                        safe_addstr(stdscr, row + 3, 2,
+                                    f"Swap: {ram['swap_used_gb']}/{ram['swap_total_gb']} GB",
+                                    curses.color_pair(2))
+                    else:
+                        safe_addstr(stdscr, row + 3, 2, "Swap: inactive",
+                                    curses.color_pair(2) | curses.A_DIM)
+
+                    # Memory breakdown (row+4): App / Wired / Compressed / Cached
+                    breakdown_full = (
+                        f"App {ram['app_gb']}G  Wired {ram['wired_gb']}G  "
+                        f"Comp {ram['compressed_gb']}G  Cache {ram['cached_gb']}G"
+                    )
+                    breakdown_short = (
+                        f"App {ram['app_gb']}G W {ram['wired_gb']}G "
+                        f"C {ram['compressed_gb']}G"
+                    )
+                    avail = mem_w - 4
+                    if avail >= len(breakdown_full):
+                        line = breakdown_full
+                    elif avail >= len(breakdown_short):
+                        line = breakdown_short
+                    else:
+                        line = f"App {ram['app_gb']}G  C {ram['compressed_gb']}G"
+                    safe_addstr(stdscr, row + 4, 2, line[:avail],
                                 curses.color_pair(2) | curses.A_DIM)
 
-                # Memory breakdown (row+4): App / Wired / Compressed / Cached
-                breakdown_full = (
-                    f"App {ram['app_gb']}G  Wired {ram['wired_gb']}G  "
-                    f"Comp {ram['compressed_gb']}G  Cache {ram['cached_gb']}G"
-                )
-                breakdown_short = (
-                    f"App {ram['app_gb']}G W {ram['wired_gb']}G "
-                    f"C {ram['compressed_gb']}G"
-                )
-                avail = mem_w - 4
-                if avail >= len(breakdown_full):
-                    line = breakdown_full
-                elif avail >= len(breakdown_short):
-                    line = breakdown_short
+                # Power box - gated on cpu_w because Power displays values
+                # derived from extract_cpu's agg dict.
+                if cpu_w is None:
+                    draw_unavailable_box(stdscr, row, half_w, mp_h, pow_w, "Power")
                 else:
-                    line = f"App {ram['app_gb']}G  C {ram['compressed_gb']}G"
-                safe_addstr(stdscr, row + 4, 2, line[:avail],
-                            curses.color_pair(2) | curses.A_DIM)
+                    throttle = "no" if thermal == "Nominal" else f"YES ({thermal})"
+                    draw_box(stdscr, row, half_w, mp_h, pow_w, "Power")
+                    safe_addstr(stdscr, row + 1, half_w + 2,
+                                f"CPU: {cpu_w:.1f}W  GPU: {gpu_w:.1f}W  ANE: {ane_w:.1f}W  "
+                                f"Total: {pkg_w:.1f}W",
+                                curses.color_pair(2))
 
-                # Power box
-                throttle = "no" if thermal == "Nominal" else f"YES ({thermal})"
-                draw_box(stdscr, row, half_w, mp_h, pow_w, "Power")
-                safe_addstr(stdscr, row + 1, half_w + 2,
-                            f"CPU: {cpu_w:.1f}W  GPU: {gpu_w:.1f}W  ANE: {ane_w:.1f}W  "
-                            f"Total: {pkg_w:.1f}W",
-                            curses.color_pair(2))
-
-                avg_cpu = sum(cpu_power_avg) / max(len(cpu_power_avg), 1)
-                avg_gpu = sum(gpu_power_avg) / max(len(gpu_power_avg), 1)
-                safe_addstr(stdscr, row + 2, half_w + 2,
-                            f"CPU avg: {avg_cpu:.1f}W pk: {cpu_peak:.1f}W  "
-                            f"GPU avg: {avg_gpu:.1f}W pk: {gpu_peak:.1f}W",
-                            curses.color_pair(2) | curses.A_DIM)
-                safe_addstr(stdscr, row + 3, half_w + 2,
-                            f"Package peak: {pkg_peak:.1f}W  Throttle: ",
-                            curses.color_pair(2))
-                tx = half_w + 2 + len(f"Package peak: {pkg_peak:.1f}W  Throttle: ")
-                tc = 4 if throttle != "no" else 6
-                safe_addstr(stdscr, row + 3, tx, throttle, curses.color_pair(tc))
+                    avg_cpu = sum(cpu_power_avg) / max(len(cpu_power_avg), 1)
+                    avg_gpu = sum(gpu_power_avg) / max(len(gpu_power_avg), 1)
+                    safe_addstr(stdscr, row + 2, half_w + 2,
+                                f"CPU avg: {avg_cpu:.1f}W pk: {cpu_peak:.1f}W  "
+                                f"GPU avg: {avg_gpu:.1f}W pk: {gpu_peak:.1f}W",
+                                curses.color_pair(2) | curses.A_DIM)
+                    safe_addstr(stdscr, row + 3, half_w + 2,
+                                f"Package peak: {pkg_peak:.1f}W  Throttle: ",
+                                curses.color_pair(2))
+                    tx = half_w + 2 + len(f"Package peak: {pkg_peak:.1f}W  Throttle: ")
+                    tc = 4 if throttle != "no" else 6
+                    safe_addstr(stdscr, row + 3, tx, throttle, curses.color_pair(tc))
 
                 # Power sparklines (each gets its own full-width row)
                 spark_w = pow_w - 8
-                if spark_w > 10 and len(cpu_power_hist) > 1:
+                if cpu_w is not None and spark_w > 10 and len(cpu_power_hist) > 1:
                     safe_addstr(stdscr, row + 4, half_w + 2, "CPU ",
                                 curses.color_pair(2))
                     draw_spark(stdscr, row + 4, half_w + 6,

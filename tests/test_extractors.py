@@ -119,6 +119,83 @@ class ExtractCpuPowerTests(unittest.TestCase):
                                 "package_w should be >= CPU+GPU+ANE")
 
 
+class ExtractorNoneSentinelTests(unittest.TestCase):
+    """UNIT D contract: every all-or-nothing extractor returns None when a
+    required field is missing, rather than silently producing zeros."""
+
+    def test_extract_cpu_missing_processor(self):
+        self.assertIsNone(SILITOP.extract_cpu({"timestamp": "x"}, SOC_M5_PRO))
+
+    def test_extract_cpu_processor_not_a_dict(self):
+        self.assertIsNone(SILITOP.extract_cpu({"processor": "garbage"}, SOC_M5_PRO))
+
+    def test_extract_cpu_missing_clusters(self):
+        self.assertIsNone(SILITOP.extract_cpu(
+            {"processor": {"combined_power": 30000}}, SOC_M5_PRO))
+
+    def test_extract_cpu_missing_combined_power(self):
+        self.assertIsNone(SILITOP.extract_cpu(
+            {"processor": {"clusters": []}}, SOC_M5_PRO))
+
+    def test_extract_cpu_skips_malformed_cluster_name(self):
+        """Empty cluster name used to crash _is_efficiency on name[0]. The
+        cluster is now skipped silently; remaining clusters still contribute."""
+        parsed = _make_parsed(clusters=[
+            {"name": "", "freq_hz": 0, "cpus": []},
+            {"name": "P-Cluster", "freq_hz": 3_000_000_000, "cpus": [
+                {"cpu": 0, "idle_ratio": 0.8, "freq_hz": 3_000_000_000}]},
+        ])
+        result = SILITOP.extract_cpu(parsed, SOC_M5_PRO)
+        self.assertIsNotNone(result)
+        cores, agg = result
+        # The malformed cluster was skipped; the P-Cluster's one core lives in
+        # the appropriate bucket.
+        all_cores = cores["e_cores"] + cores["p_cores"]
+        self.assertEqual(len(all_cores), 1)
+
+    def test_extract_gpu_missing(self):
+        self.assertIsNone(SILITOP.extract_gpu({"timestamp": "x"}))
+
+    def test_extract_gpu_not_a_dict(self):
+        self.assertIsNone(SILITOP.extract_gpu({"gpu": "garbage"}))
+
+    def test_extract_gpu_missing_idle_ratio(self):
+        self.assertIsNone(SILITOP.extract_gpu({"gpu": {"freq_hz": 1000}}))
+
+    def test_extract_gpu_missing_freq(self):
+        self.assertIsNone(SILITOP.extract_gpu({"gpu": {"idle_ratio": 0.5}}))
+
+    def test_extract_gpu_success(self):
+        info = SILITOP.extract_gpu({"gpu": {"idle_ratio": 0.5, "freq_hz": 1000}})
+        self.assertEqual(info["active"], 50)
+        self.assertEqual(info["freq_mhz"], 1000)
+
+    def test_extract_network_missing(self):
+        self.assertIsNone(SILITOP.extract_network({"timestamp": "x"}))
+
+    def test_extract_network_partial(self):
+        # Missing ibyte_rate -> None (no silent zeros).
+        self.assertIsNone(SILITOP.extract_network({"network": {"obyte_rate": 100}}))
+
+    def test_extract_network_success(self):
+        info = SILITOP.extract_network(
+            {"network": {"ibyte_rate": 1024, "obyte_rate": 2048}})
+        self.assertEqual(info["in_rate"], 1024)
+        self.assertEqual(info["out_rate"], 2048)
+
+    def test_extract_disk_missing(self):
+        self.assertIsNone(SILITOP.extract_disk({"timestamp": "x"}))
+
+    def test_extract_disk_partial(self):
+        self.assertIsNone(SILITOP.extract_disk({"disk": {"rbytes_per_s": 100}}))
+
+    def test_extract_disk_success(self):
+        info = SILITOP.extract_disk(
+            {"disk": {"rbytes_per_s": 4096, "wbytes_per_s": 8192}})
+        self.assertEqual(info["read_rate"], 4096)
+        self.assertEqual(info["write_rate"], 8192)
+
+
 class DeltaTComputationTests(unittest.TestCase):
     """delta_t_s is computed inline in main(); replicate the math here for
     unit-test coverage of the boundary cases that matter."""
