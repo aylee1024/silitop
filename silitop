@@ -34,7 +34,6 @@ SYSTEM_HELPER_DIR = "/usr/local/bin"
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-BLOCK_CHARS = " ▏▎▍▌▋▊▉█"
 COLOR_SCHEMES = {
     0: (curses.COLOR_WHITE, curses.COLOR_BLACK),
     1: (curses.COLOR_RED, curses.COLOR_BLACK),
@@ -721,18 +720,24 @@ def init_colors(scheme):
     curses.init_pair(7, fg, -1)            # border
 
 
-def hbar(width, pct, filled_char="█", empty_char="░"):
-    """Render a horizontal bar string of given width at pct%."""
-    if width <= 0:
-        return ""
-    fill = int(pct / 100 * width)
-    fill = min(fill, width)
-    return filled_char * fill + empty_char * (width - fill)
-
-
 def clamp_pct(pct):
-    """Clamp a percentage to the range the UI can safely render."""
-    return max(0, min(int(pct), 100))
+    """Clamp a percentage to the range the UI can safely render.
+
+    Tolerates None, non-numeric, NaN, and inf inputs by returning 0 instead
+    of raising. The prior implementation called int(pct) unconditionally,
+    which raised TypeError on None and ValueError on NaN, propagating out
+    of the curses draw path and crashing the dashboard.
+    """
+    if pct is None:
+        return 0
+    try:
+        f = float(pct)
+    except (TypeError, ValueError):
+        return 0
+    import math
+    if not math.isfinite(f):
+        return 0
+    return max(0, min(int(f), 100))
 
 
 def compute_bar_layout(total_width, pct, label="", suffix=""):
@@ -759,14 +764,29 @@ def compute_bar_layout(total_width, pct, label="", suffix=""):
 
 
 def temp_color(temp):
-    """Return color pair number based on temperature."""
-    if temp < 0:
-        return 2
-    if temp < 50:
-        return 5  # cyan/cool
-    if temp < 70:
-        return 3  # yellow/warm
-    return 4  # red/hot
+    """Return color pair number based on temperature.
+
+    README spec: cyan < 50C, yellow 50-70C, red > 70C. Prior code returned
+    red at exactly 70 (`if temp < 70: yellow`), violating the README range.
+    None / NaN return the yellow warning color rather than the default
+    white-on-default, so a degenerate input is visually distinguishable.
+    """
+    import math
+    if temp is None:
+        return 3
+    try:
+        t = float(temp)
+    except (TypeError, ValueError):
+        return 3
+    if not math.isfinite(t):
+        return 3
+    if t < 0:
+        return 3
+    if t < 50:
+        return 5  # cyan / cool
+    if t <= 70:
+        return 3  # yellow / warm (50-70 inclusive per README)
+    return 4      # red / hot
 
 
 def draw_box(win, y, x, h, w, title="", color_pair=7):
@@ -1045,6 +1065,13 @@ def main(stdscr, args):
             key = stdscr.getch()
             if key == ord("q") or key == 27:
                 break
+            if key == curses.KEY_RESIZE:
+                # Force-re-render on the next iteration. Without this, the
+                # main loop only redraws after the next ACCEPTED powermetrics
+                # sample, so if powermetrics is stalled or slow the resize
+                # never repairs the screen.
+                stdscr.clear()
+                continue
 
             # Detect dead powermetrics. Without this, the file stops advancing
             # but parse_powermetrics keeps returning the last sample (read from
@@ -1591,6 +1618,17 @@ def entry():
         print("silitop requires root privileges for powermetrics.")
         print("Run with: sudo silitop")
         sys.exit(1)
+
+    # Initialize the user's locale before curses so Unicode block / box /
+    # sparkline glyphs render at the cell-widths the layout code assumes.
+    # Under LC_ALL=C (the sudo-stripped default on some systems), curses
+    # narrows non-ASCII writes; safe_addstr's curses.error swallow then
+    # silently drops them and the UI looks broken.
+    import locale as _locale
+    try:
+        _locale.setlocale(_locale.LC_ALL, "")
+    except _locale.Error:
+        pass
 
     curses.wrapper(lambda stdscr: main(stdscr, args))
 

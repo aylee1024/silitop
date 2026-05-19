@@ -112,6 +112,55 @@ class LayoutTests(unittest.TestCase):
                 self.assertNotIn("░", segment[suffix_start:])
 
 
+    def test_clamp_pct_safe_against_degenerate_inputs(self):
+        """clamp_pct must not crash the curses draw path on None / NaN / inf
+        / non-numeric inputs. The prior implementation called int(pct)
+        unconditionally and propagated TypeError / ValueError."""
+        cases = [
+            (None, 0),
+            ("not a number", 0),
+            (float("nan"), 0),
+            (float("inf"), 0),
+            (float("-inf"), 0),
+            (-50, 0),
+            (0, 0),
+            (50, 50),
+            (99.9, 99),
+            (100, 100),
+            (145, 100),
+        ]
+        for inp, expected in cases:
+            with self.subTest(inp=inp):
+                self.assertEqual(SILITOP.clamp_pct(inp), expected)
+
+    def test_temp_color_thresholds_match_readme(self):
+        """README spec: cyan < 50, yellow 50-70 inclusive, red > 70. The
+        prior code returned red at exactly 70."""
+        # Pair numbers from init_colors: 3 yellow, 4 red, 5 cyan.
+        cases = [
+            (-10, 3),       # negative -> warning (was: pair 2 plain white)
+            (None, 3),      # missing -> warning
+            (float("nan"), 3),
+            (0, 5),         # zero is a valid measurement (M1 cold-boot edge)
+            (25, 5),
+            (49.9, 5),
+            (50, 3),        # boundary: 50 is yellow
+            (60, 3),
+            (70, 3),        # boundary: 70 still yellow per README
+            (70.5, 4),
+            (95, 4),
+        ]
+        for temp, expected in cases:
+            with self.subTest(temp=temp):
+                self.assertEqual(SILITOP.temp_color(temp), expected,
+                                 f"temp={temp} expected pair {expected}")
+
+    def test_block_chars_and_hbar_removed(self):
+        """Audit #50: dead BLOCK_CHARS constant and dead hbar function with
+        an off-by-one on negative percentages. Both deleted in UNIT H."""
+        self.assertFalse(hasattr(SILITOP, "BLOCK_CHARS"))
+        self.assertFalse(hasattr(SILITOP, "hbar"))
+
     def test_fan_row_suffix_stays_intact(self):
         cases = [
             (50, 2000, "50%", "2000r"),
