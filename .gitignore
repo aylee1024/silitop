@@ -5,3 +5,5 @@ silitop-temps
 silitop-fans
 *.o
 .worktrees/
+.build/
+.swiftpm/

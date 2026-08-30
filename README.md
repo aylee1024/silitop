@@ -1,34 +1,40 @@
 # silitop
 
-A CLI performance monitor for Apple Silicon Macs, inspired by [asitop](https://github.com/tlkh/asitop).
+A lightweight, native Apple Silicon performance monitor for macOS, inspired by [asitop](https://github.com/tlkh/asitop).
 
-Shows per-core CPU utilization, GPU usage, fan speed, network/disk I/O, power consumption, memory, and die temperatures in a single dashboard.
+silitop shows per-core CPU activity, GPU and ANE use, fans, power, network and disk throughput, memory pressure, temperatures, and thermal pressure in one terminal dashboard.
 
 ![silitop screenshot](screenshot.png)
 
+## Why the native version
+
+silitop is now one dependency-free Swift executable. The dashboard no longer needs Python, curses, recurring temperature/fan helper processes, or temporary plist files. After startup, its only recurring child is Apple's `powermetrics`.
+
+The native event loop reads `powermetrics` records directly from a bounded pipe, samples memory and sensors in-process, and draws each frame with one terminal write. Collection failures are never displayed as zero: an affected panel says `unavailable`, or retains its last good value with a visible `stale Ns` age.
+
 ## Features
 
-- **Per-core CPU bars** with usage % and frequency for every core
-- **Automatic core tier detection**: Super/Performance (M5), Efficiency/Performance (M1-M4)
-- **GPU utilization** bar with frequency and die temperature
-- **Fan speed** RPM and percentage bars (shown in CPU box blank space on asymmetric-core chips)
-- **ANE** (Apple Neural Engine) usage
-- **Network** throughput with in/out sparklines
-- **Disk I/O** throughput with read/write sparklines
-- **Memory** usage with swap status
-- **Power** consumption: per-subsystem watts, averages, peaks, sparkline history
-- **Die temperatures**: 14 thermal zones (CPU + GPU), SSD, battery
-- **Thermal pressure** indicator (Nominal/Heavy/Trapping/Sleeping)
-- Color-coded temperatures (cyan < 50C, yellow 50-70C, red > 70C)
-- Zero Python dependencies (standard library only)
-- Responsive to terminal size
+- Per-core CPU bars with one-based labels, utilization, and frequency fallback
+- Automatic M1–M5+ core-tier names and counts
+- GPU utilization, core count, and frequency
+- Apple Neural Engine power and estimated utilization
+- Fan RPM and maximum-speed percentage, including confirmed fanless Macs
+- CPU, GPU, ANE, package power, moving averages, peaks, and history
+- Network and disk throughput with history
+- Activity Monitor-style memory math plus native swap readings
+- Classified CPU/GPU die zones, SSD and battery temperatures
+- Thermal pressure and visible stale/unavailable states
+- Responsive resize, signal-safe cleanup, and concurrent-instance support
+- No third-party packages or configuration files
 
 ## Requirements
 
-- macOS on Apple Silicon (M1, M2, M3, M4, M5, or later)
-- Python 3.8+
-- Swift compiler (`xcode-select --install` if needed)
-- `sudo` (required for `powermetrics`)
+- Apple Silicon Mac (M1 or later)
+- macOS 13 Ventura or later
+- Xcode Command Line Tools for installation (`xcode-select --install`)
+- `sudo` for the dashboard because Apple restricts `powermetrics`
+
+`--test-temps` does not require root and does not start the dashboard or `powermetrics`.
 
 ## Installation
 
@@ -38,7 +44,15 @@ cd silitop
 bash install.sh
 ```
 
-The install script compiles the Swift helpers and copies all binaries to `/usr/local/bin/`.
+The installer builds a stripped release executable as your user, then atomically installs it at `/usr/local/bin/silitop` as `root:wheel` mode `0755`. Set `SILITOP_INSTALL_DIR` to choose another directory.
+
+Upgrade by running `bash install.sh` again. The installer removes helper binaries left by older Python-based releases.
+
+Uninstall with:
+
+```bash
+bash install.sh --uninstall
+```
 
 ## Usage
 
@@ -46,62 +60,40 @@ The install script compiles the Swift helpers and copies all binaries to `/usr/l
 sudo silitop
 ```
 
-### Options
-
 | Flag | Default | Description |
-|------|---------|-------------|
-| `--interval N` | 1 | Sampling interval in seconds |
-| `--color N` | 2 (green) | Color scheme (0=white, 1=red, 2=green, 3=yellow, 4=blue, 5=magenta, 6=cyan) |
-| `--avg N` | 30 | Power averaging window in seconds |
-| `--test-temps` | - | Print raw temperature sensor readings and exit |
+|---|---:|---|
+| `--interval N` | `1` | Sampling interval in seconds; minimum 1 |
+| `--color N` | `2` | 0=white, 1=red, 2=green, 3=yellow, 4=blue, 5=magenta, 6=cyan |
+| `--avg N` | `30` | Power averaging window in seconds; must be at least the interval |
+| `--test-temps` | — | Print temperature readings and exit without root |
 
-Press `q` or `Esc` to quit.
-
-## How it works
-
-- **CPU/GPU/Power data**: reads Apple's `powermetrics` tool (plist output), same source as asitop
-- **Temperatures**: compiled Swift helper reads IOHIDEventSystemClient thermal sensors (no SMC hacks)
-- **Fan speed**: compiled Swift helper reads AppleSMC via IOKit for fan RPM
-- **Network/Disk**: `powermetrics` network and disk samplers (same subprocess, zero extra cost)
-- **Memory**: parses `vm_stat` and `sysctl` (no psutil dependency)
+Press `q`, `Esc`, or Ctrl-C to quit. The original terminal mode, cursor, and screen are restored on normal quit, signals, startup failure, collector death, or a stalled stream.
 
 ## Architecture
 
-```
-silitop (Python, curses UI)
-  |
-  |-- powermetrics subprocess (cpu_power, gpu_power, thermal, network, disk)
-  |     writes plist to /tmp/silitop_pm*
-  |
-  |-- silitop-temps (compiled Swift binary)
-  |     reads IOHIDEventSystemClient temperature sensors
-  |     outputs sensor_name|temperature pairs
-  |
-  |-- silitop-fans (compiled Swift binary)
-        reads AppleSMC fan RPM via IOKit
-        outputs FAN0|rpm|max_rpm pairs
+```text
+silitop (native Swift executable)
+  ├─ kqueue: terminal input, resize/signals, child pipes/exits, stall timer
+  ├─ powermetrics (one recurring child; NUL-delimited plist on stdout)
+  ├─ host_statistics64 + sysctlbyname (memory, swap, topology)
+  ├─ IOHIDEventSystemClient (persistent temperature collector)
+  ├─ AppleSMC / IOKit (persistent fan collector)
+  └─ system_profiler (one concurrent, startup-only topology fallback)
 ```
 
-## Differences from asitop
+The full `cpu_power,gpu_power,thermal,network,disk` sampler set is attempted first. If that set is rejected before a valid record, silitop retries once with the essential CPU/GPU/thermal set. Malformed or oversized records are skipped; a missing section only disables its own panel. A stream with no valid plist for `max(3 seconds, 3 × interval)` exits cleanly with a diagnostic.
 
-| Feature | asitop | silitop |
-|---------|--------|---------|
-| Per-core CPU bars | Optional (`--show_cores`) | Always shown |
-| Temperatures | No | Yes (14 die zones + SSD + battery) |
-| GPU die temp | No | Yes |
-| Fan speed | No | Yes (RPM + % bar) |
-| Dependencies | psutil, dashing, blessed | None (stdlib only) |
-| Core tier labels | E-CPU/P-CPU only | Auto-detects (Super/Performance on M5) |
-| UI framework | blessed + dashing | Pure curses |
+Temperature access uses private IOHID symbols that are resolved at runtime so a missing or changed API produces an explicit unavailable state instead of a launch failure. Sensor handles stay open and are rebuilt after read failures. Warm temperature work is bounded below the 20 ms p99 release gate on the M5 Pro reference system.
 
-## Contributing
+## Development
 
-Contributions welcome. Some areas that could use help:
+```bash
+swift test
+swift build -c release --product silitop
+bash -n install.sh
+```
 
-- **Per-core temperature mapping**: the 14 die zone sensors don't map 1:1 to cores. If you can figure out the exact mapping for your chip, open an issue.
-- **M1/M2/M3/M4 testing**: built and tested on M5 Pro, needs validation on older chips.
-- **Better TDP estimates**: power gauge percentages depend on max power estimates per SoC variant.
-- **Bandwidth counters**: powermetrics exposes memory bandwidth data that could be displayed.
+CI verifies tests, release compilation, installer syntax, and the macOS 13 minimum deployment target. A real Ventura Mac or VM is still required before claiming Ventura runtime compatibility because current hosted runner images no longer provide the standard macOS 13 environment.
 
 ## License
 
