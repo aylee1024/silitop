@@ -67,6 +67,22 @@ final class SpawnedChildTests: XCTestCase {
         XCTAssertEqual(String(decoding: second.readStdout(), as: UTF8.self), "second\n")
     }
 
+    func testEventSnapshotKeepsBatchDescriptorIdentityAfterChildCleanup() throws {
+        let child = try SpawnedChild.spawn(executable: "/bin/sleep", arguments: ["10"])
+        let snapshot = SpawnedChildEventSnapshot(child)
+        let originalStdout = child.stdoutFD
+        let originalStderr = child.stderrFD
+
+        child.cleanup(graceMilliseconds: 20)
+
+        XCTAssertTrue(snapshot.child === child)
+        XCTAssertEqual(snapshot.stdoutFD, originalStdout)
+        XCTAssertEqual(snapshot.stderrFD, originalStderr)
+        XCTAssertEqual(snapshot.pid, child.pid)
+        XCTAssertEqual(child.stdoutFD, -1)
+        XCTAssertEqual(child.stderrFD, -1)
+    }
+
     private func waitForExit(_ child: SpawnedChild) -> Int32? {
         let deadline = Date().addingTimeInterval(2)
         while Date() < deadline {

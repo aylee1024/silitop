@@ -17,6 +17,20 @@ final class KqueueTests: XCTestCase {
         XCTAssertTrue(events.contains(.read(descriptors[0])))
     }
 
+    func testPipeEOFIsNotReportedAsOrdinaryReadableData() throws {
+        var descriptors: [Int32] = [0, 0]
+        XCTAssertEqual(pipe(&descriptors), 0)
+        defer { Darwin.close(descriptors[0]) }
+        let queue = try Kqueue()
+        try queue.watchRead(descriptors[0])
+
+        XCTAssertEqual(Darwin.close(descriptors[1]), 0)
+        let events = try queue.wait(maxEvents: 4, timeoutMilliseconds: 100)
+
+        XCTAssertFalse(events.contains(.read(descriptors[0])))
+        XCTAssertTrue(events.contains(.readEOF(descriptors[0])))
+    }
+
     func testProcessExitEventCarriesChildPID() throws {
         let child = try SpawnedChild.spawn(executable: "/usr/bin/true", arguments: [])
         defer { child.cleanup() }

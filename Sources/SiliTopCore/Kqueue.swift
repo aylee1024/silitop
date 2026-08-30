@@ -14,6 +14,7 @@ public enum EventLoopError: Error, CustomStringConvertible {
 
 public enum KqueueEvent: Equatable {
     case read(Int32)
+    case readEOF(Int32)
     case processExit(pid_t)
     case timer(UInt)
     case signal(Int32)
@@ -135,6 +136,9 @@ public final class Kqueue {
         }
         switch event.filter {
         case Int16(EVFILT_READ):
+            if event.flags & UInt16(EV_EOF) != 0 {
+                return .readEOF(Int32(event.ident))
+            }
             return .read(Int32(event.ident))
         case Int16(EVFILT_PROC):
             return .processExit(pid_t(event.ident))

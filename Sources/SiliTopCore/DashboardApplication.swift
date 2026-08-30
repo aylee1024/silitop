@@ -239,7 +239,10 @@ public final class DashboardApplication: @unchecked Sendable {
         }
 
         while true {
-            for event in try queue.wait(maxEvents: 16) {
+            let events = try queue.wait(maxEvents: 16)
+            let samplerAtWait = sampler.map(SpawnedChildEventSnapshot.init)
+            let profilerAtWait = profiler.map(SpawnedChildEventSnapshot.init)
+            for event in events {
                 switch event {
                 case let .read(descriptor) where descriptor == terminal.inputFD:
                     var buffer = [UInt8](repeating: 0, count: 64)
@@ -255,23 +258,50 @@ public final class DashboardApplication: @unchecked Sendable {
                         break
                     }
 
-                case let .read(descriptor) where descriptor == sampler?.stdoutFD:
-                    try processSamplerData(sampler?.readStdout() ?? Data())
+                case let .read(descriptor) where descriptor == samplerAtWait?.stdoutFD:
+                    try processSamplerData(samplerAtWait?.child.readStdout() ?? Data())
 
-                case let .read(descriptor) where descriptor == sampler?.stderrFD:
-                    stderrTail.append(sampler?.readStderr() ?? Data())
+                case let .read(descriptor) where descriptor == samplerAtWait?.stderrFD:
+                    stderrTail.append(samplerAtWait?.child.readStderr() ?? Data())
 
-                case let .read(descriptor) where descriptor == profiler?.stdoutFD:
-                    let bytes = profiler?.readStdout() ?? Data()
+                case let .read(descriptor) where descriptor == profilerAtWait?.stdoutFD:
+                    let bytes = profilerAtWait?.child.readStdout() ?? Data()
                     if profilerOutput.count + bytes.count <= 8 * 1_024 * 1_024 {
                         profilerOutput.append(bytes)
                     }
 
-                case let .read(descriptor) where descriptor == profiler?.stderrFD:
-                    _ = profiler?.readStderr()
+                case let .read(descriptor) where descriptor == profilerAtWait?.stderrFD:
+                    _ = profilerAtWait?.child.readStderr()
 
-                case let .processExit(pid) where pid == sampler?.pid:
-                    if let current = sampler {
+                case let .readEOF(descriptor) where descriptor == terminal.inputFD:
+                    return
+
+                case let .readEOF(descriptor) where descriptor == samplerAtWait?.stdoutFD:
+                    if let current = samplerAtWait?.child {
+                        try drainSamplerOutput(current)
+                        current.closeStdout()
+                    }
+
+                case let .readEOF(descriptor) where descriptor == samplerAtWait?.stderrFD:
+                    if let current = samplerAtWait?.child {
+                        drainStderr(current)
+                        current.closeStderr()
+                    }
+
+                case let .readEOF(descriptor) where descriptor == profilerAtWait?.stdoutFD:
+                    if let current = profilerAtWait?.child {
+                        drainProfilerOutput(current)
+                        current.closeStdout()
+                    }
+
+                case let .readEOF(descriptor) where descriptor == profilerAtWait?.stderrFD:
+                    if let current = profilerAtWait?.child {
+                        while !current.readStderr().isEmpty {}
+                        current.closeStderr()
+                    }
+
+                case let .processExit(pid) where pid == samplerAtWait?.pid:
+                    if let current = samplerAtWait?.child {
                         try drainSamplerOutput(current)
                         drainStderr(current)
                         _ = current.reapIfExited()
@@ -290,8 +320,8 @@ public final class DashboardApplication: @unchecked Sendable {
                         throw DashboardRuntimeError.collectorExited(lastDiagnostic(stderrTail.string))
                     }
 
-                case let .processExit(pid) where pid == profiler?.pid:
-                    if let current = profiler {
+                case let .processExit(pid) where pid == profilerAtWait?.pid:
+                    if let current = profilerAtWait?.child {
                         drainProfilerOutput(current)
                         while !current.readStderr().isEmpty {}
                         _ = current.reapIfExited()
