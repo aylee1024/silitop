@@ -239,7 +239,9 @@ public struct DashboardRenderer {
 
     private func aneText(_ value: PowerReading, topology: Topology, width: Int) -> String {
         let limit = max(0.001, topology.powerLimits.aneWatts)
-        let percent = min(100, max(0, Int((value.aneWatts / limit * 100).rounded())))
+        let rawPercent = value.aneWatts / limit * 100
+        let boundedPercent = rawPercent.isFinite ? min(100, max(0, rawPercent)) : 0
+        let percent = Int(boundedPercent.rounded())
         let suffix = String(format: " %3d%% %.1fW", percent, value.aneWatts)
         return "ANE\n" + HorizontalBar.render(width: width, percent: percent, label: "ANE ", suffix: suffix)
     }
@@ -335,11 +337,15 @@ public struct DashboardRenderer {
     }
 
     private func memoryText(_ value: MemoryReading) -> String {
-        String(
-            format: "Memory  %.1f/%.1f GB (%d%%)  App %.1f  Wired %.1f  Compressed %.1f  Cached %.1f  Swap %.1f/%.1f GB",
+        let memory = String(
+            format: "Memory  %.1f/%.1f GB (%d%%)  App %.1f  Wired %.1f  Compressed %.1f  Cached %.1f",
             value.usedGiB, value.totalGiB, value.percentUsed, value.appGiB, value.wiredGiB,
-            value.compressedGiB, value.cachedGiB, value.swapUsedGiB, value.swapTotalGiB
+            value.compressedGiB, value.cachedGiB
         )
+        guard let used = value.swapUsedGiB, let total = value.swapTotalGiB else {
+            return memory + "  Swap unavailable"
+        }
+        return memory + String(format: "  Swap %.1f/%.1f GB", used, total)
     }
 
     private func temperatureSection(
@@ -429,10 +435,13 @@ public struct DashboardRenderer {
     }
 
     private func sparkline(_ values: [Double], maximum fixedMaximum: Double? = nil) -> String {
-        guard let maximum = fixedMaximum ?? values.max(), maximum > 0 else { return "" }
+        let validValues = values.map { $0.isFinite && $0 >= 0 ? $0 : 0 }
+        let requestedMaximum = fixedMaximum.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        guard let maximum = requestedMaximum ?? validValues.max(), maximum > 0 else { return "" }
         let glyphs = Array("▁▂▃▄▅▆▇█")
-        return String(values.suffix(12).map { value in
-            let index = min(glyphs.count - 1, max(0, Int((value / maximum) * Double(glyphs.count - 1))))
+        return String(validValues.suffix(12).map { value in
+            let ratio = min(1, max(0, value / maximum))
+            let index = Int((ratio * Double(glyphs.count - 1)).rounded(.towardZero))
             return glyphs[index]
         })
     }

@@ -29,19 +29,20 @@ public struct PowerMetricsCommand: Equatable, Sendable {
     public let arguments: [String]
 
     public init(intervalSeconds: Int, samplerSet: PowerMetricsSamplerSet) {
+        let safeInterval = max(1, min(intervalSeconds, Int.max / 1_000))
         executable = "/usr/bin/nice"
         arguments = [
             "-n", "10", "/usr/bin/powermetrics",
             "-b", "0",
             "-f", "plist",
             "-o", "-",
-            "-i", String(max(1, intervalSeconds) * 1_000),
+            "-i", String(safeInterval * 1_000),
             "--samplers", samplerSet.value,
         ]
     }
 
     public static func stallTimeout(intervalSeconds: Int) -> TimeInterval {
-        max(3, Double(max(1, intervalSeconds) * 3))
+        max(3, Double(max(1, intervalSeconds)) * 3)
     }
 
     public var childCommand: ChildCommand {

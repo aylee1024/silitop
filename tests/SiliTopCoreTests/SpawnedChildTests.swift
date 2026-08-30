@@ -15,6 +15,20 @@ final class SpawnedChildTests: XCTestCase {
         XCTAssertLessThanOrEqual(child.readStdout(maximumBytes: 4_096).count, 4_096)
     }
 
+    func testChildDoesNotInheritDashboardIgnoredTerminationSignals() throws {
+        let prior = Darwin.signal(SIGTERM, SIG_IGN)
+        defer { _ = Darwin.signal(SIGTERM, prior) }
+        let child = try SpawnedChild.spawn(
+            executable: "/bin/sh",
+            arguments: ["-c", "kill -TERM $$; echo survived"]
+        )
+        defer { child.cleanup() }
+        let deadline = Date().addingTimeInterval(1)
+        while Date() < deadline, child.reapIfExited() == nil { usleep(1_000) }
+
+        XCTAssertFalse(String(decoding: child.readStdout(), as: UTF8.self).contains("survived"))
+    }
+
     func testSpawnStreamsStdoutAndStderrThroughNonblockingPipes() throws {
         let child = try SpawnedChild.spawn(
             executable: "/bin/sh",

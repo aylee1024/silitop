@@ -35,6 +35,7 @@ public struct CLIUsageError: Error, Equatable, CustomStringConvertible {
 }
 
 public enum CLIParser {
+    private static let maximumIntervalSeconds = Int.max / 1_000
     public static let helpText = """
     Usage: silitop [--interval SECONDS] [--color 0-6] [--avg SECONDS] [--test-temps]
 
@@ -91,6 +92,9 @@ public enum CLIParser {
 
         guard options.intervalSeconds >= 1 else {
             throw CLIUsageError("--interval must be >= 1 (seconds)")
+        }
+        guard options.intervalSeconds <= maximumIntervalSeconds else {
+            throw CLIUsageError("--interval is too large")
         }
         guard (0...6).contains(options.colorScheme) else {
             throw CLIUsageError("--color must be between 0 and 6")

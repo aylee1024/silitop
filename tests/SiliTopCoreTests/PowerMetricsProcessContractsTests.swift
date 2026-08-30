@@ -44,6 +44,8 @@ final class PowerMetricsProcessContractsTests: XCTestCase {
     func testStallDeadlineIsAtLeastThreeSecondsAndThreeIntervals() {
         XCTAssertEqual(PowerMetricsCommand.stallTimeout(intervalSeconds: 1), 3)
         XCTAssertEqual(PowerMetricsCommand.stallTimeout(intervalSeconds: 5), 15)
+        XCTAssertTrue(PowerMetricsCommand.stallTimeout(intervalSeconds: Int.max).isFinite)
+        XCTAssertFalse(PowerMetricsCommand(intervalSeconds: Int.max, samplerSet: .full).arguments.isEmpty)
     }
 
     func testStderrTailKeepsOnlyLastEightKiBAcrossFragmentedWrites() {

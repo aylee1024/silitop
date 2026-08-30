@@ -27,7 +27,7 @@ final class ReleaseConfigurationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("bash -n install.sh"))
         XCTAssertTrue(workflow.contains("vtool -show-build"))
         XCTAssertTrue(workflow.contains("13.0"))
-        XCTAssertTrue(workflow.contains("strip -x"))
+        XCTAssertTrue(workflow.contains("strip \"${binary}\""))
         XCTAssertTrue(workflow.contains("400150"))
     }
 }

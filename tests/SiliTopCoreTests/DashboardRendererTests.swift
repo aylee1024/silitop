@@ -164,6 +164,42 @@ final class DashboardRendererTests: XCTestCase {
         XCTAssertFalse(text.contains("Disk I/O"))
     }
 
+    func testMissingSwapRendersUnavailableWithoutVoidingMemoryPanel() {
+        var snapshot = completeSnapshot()
+        snapshot.memory = .fresh(MemoryReading(
+            totalGiB: 64, usedGiB: 32, freeGiB: 32, percentUsed: 50,
+            wiredGiB: 5, compressedGiB: 4, appGiB: 23, cachedGiB: 8,
+            swapTotalGiB: nil, swapUsedGiB: nil
+        ), observedAt: observed)
+
+        let text = String(decoding: DashboardRenderer(ansi: false).render(
+            snapshot: snapshot,
+            histories: DashboardHistories(),
+            size: TerminalSize(rows: 60, columns: 160)
+        ), as: UTF8.self)
+
+        XCTAssertTrue(text.contains("Memory  32.0/64.0 GB"))
+        XCTAssertTrue(text.contains("Swap unavailable"))
+    }
+
+    func testHugeFinitePowerDoesNotTrapRendererIntegerConversions() {
+        var snapshot = completeSnapshot()
+        snapshot.power = .fresh(PowerReading(
+            cpuWatts: 1e300, gpuWatts: 1e300, aneWatts: 1e300, packageWatts: 1e300,
+            cpuAverageWatts: 1e300, gpuAverageWatts: 1e300,
+            cpuPeakWatts: 1e300, gpuPeakWatts: 1e300, packagePeakWatts: 1e300
+        ), observedAt: observed)
+
+        let text = String(decoding: DashboardRenderer(ansi: false).render(
+            snapshot: snapshot,
+            histories: DashboardHistories(cpuPower: [1e300]),
+            size: TerminalSize(rows: 60, columns: 120)
+        ), as: UTF8.self)
+
+        XCTAssertTrue(text.contains("ANE"))
+        XCTAssertTrue(text.contains("100%"))
+    }
+
     private func completeSnapshot() -> DashboardSnapshot {
         let topology = Topology(
             name: "Apple M5 Pro",

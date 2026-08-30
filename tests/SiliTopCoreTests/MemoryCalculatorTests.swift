@@ -45,8 +45,8 @@ final class MemoryCalculatorTests: XCTestCase {
 
         XCTAssertEqual(reading.percentUsed, 100)
         XCTAssertEqual(reading.usedGiB, reading.totalGiB)
-        XCTAssertEqual(reading.swapTotalGiB, 0)
-        XCTAssertEqual(reading.swapUsedGiB, 0)
+        XCTAssertNil(reading.swapTotalGiB)
+        XCTAssertNil(reading.swapUsedGiB)
     }
 
     func testInvalidPageSizeReturnsUnavailable() {

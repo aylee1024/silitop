@@ -116,6 +116,60 @@ final class DashboardStateControllerTests: XCTestCase {
         XCTAssertEqual(cpu.slowFrequencyMHz, 3_000)
     }
 
+    func testFirstFrameZeroFrequencyUsesLaterSiblingInSameTier() {
+        var controller = DashboardStateController(topology: topology, intervalSeconds: 1, averageSeconds: 30)
+        let observed = Date(timeIntervalSince1970: 100)
+        let reading = sample(
+            energy: 1,
+            timestamp: observed,
+            fastCores: [
+                CoreReading(id: 0, activePercent: 100, frequencyMHz: 0),
+                CoreReading(id: 1, activePercent: 50, frequencyMHz: 3_000),
+            ]
+        )
+
+        let snapshot = controller.accept(
+            reading,
+            memory: .unavailable(reason: "test"),
+            temperatures: .unavailable(reason: "test"),
+            fans: .unavailable(reason: "test"),
+            at: observed
+        )
+
+        guard case let .fresh(cpu, _) = snapshot.cpu else { return XCTFail("Expected CPU") }
+        XCTAssertEqual(cpu.fastCores.map(\.frequencyMHz), [3_000, 3_000])
+    }
+
+    func testCurrentSiblingFrequencyBeatsHistoricalTierPeakForNewCore() {
+        var controller = DashboardStateController(topology: topology, intervalSeconds: 1, averageSeconds: 30)
+        let firstDate = Date(timeIntervalSince1970: 100)
+        _ = controller.accept(
+            sample(
+                energy: 1,
+                timestamp: firstDate,
+                fastCores: [CoreReading(id: 0, activePercent: 20, frequencyMHz: 4_000)]
+            ),
+            memory: .unavailable(reason: "test"), temperatures: .unavailable(reason: "test"),
+            fans: .unavailable(reason: "test"), at: firstDate
+        )
+        let secondDate = firstDate.addingTimeInterval(1)
+        let snapshot = controller.accept(
+            sample(
+                energy: 1,
+                timestamp: secondDate,
+                fastCores: [
+                    CoreReading(id: 2, activePercent: 100, frequencyMHz: 0),
+                    CoreReading(id: 1, activePercent: 50, frequencyMHz: 2_000),
+                ]
+            ),
+            memory: .unavailable(reason: "test"), temperatures: .unavailable(reason: "test"),
+            fans: .unavailable(reason: "test"), at: secondDate
+        )
+
+        guard case let .fresh(cpu, _) = snapshot.cpu else { return XCTFail("Expected CPU") }
+        XCTAssertEqual(cpu.fastCores.map(\.frequencyMHz), [2_000, 2_000])
+    }
+
     func testTimestampGateRejectsDuplicateAndOutOfOrderRecords() {
         var gate = SampleTimestampGate()
         let first = Date(timeIntervalSince1970: 100)
@@ -127,9 +181,39 @@ final class DashboardStateControllerTests: XCTestCase {
         XCTAssertTrue(gate.shouldAccept(nil))
     }
 
+    func testMissingTimestampBreaksDeltaContinuityForNextSample() {
+        var controller = DashboardStateController(topology: topology, intervalSeconds: 1, averageSeconds: 30)
+        let first = Date(timeIntervalSince1970: 100)
+        _ = controller.accept(sample(energy: 1, timestamp: first), memory: .unavailable(reason: "test"), temperatures: .unavailable(reason: "test"), fans: .unavailable(reason: "test"), at: first)
+        _ = controller.accept(sample(energy: 1, timestamp: nil), memory: .unavailable(reason: "test"), temperatures: .unavailable(reason: "test"), fans: .unavailable(reason: "test"), at: first.addingTimeInterval(1))
+        let result = controller.accept(sample(energy: 1, timestamp: first.addingTimeInterval(2)), memory: .unavailable(reason: "test"), temperatures: .unavailable(reason: "test"), fans: .unavailable(reason: "test"), at: first.addingTimeInterval(2))
+
+        guard case let .fresh(power, _) = result.power else { return XCTFail("Expected fresh power") }
+        XCTAssertEqual(power.cpuWatts, 1, accuracy: 0.001)
+    }
+
+    func testOverflowingEnergyRateMakesPowerUnavailableInsteadOfZero() {
+        var controller = DashboardStateController(topology: topology, intervalSeconds: 1, averageSeconds: 30)
+        let first = Date(timeIntervalSince1970: 100)
+        _ = controller.accept(
+            sample(energy: Double.greatestFiniteMagnitude, timestamp: first),
+            memory: .unavailable(reason: "test"), temperatures: .unavailable(reason: "test"),
+            fans: .unavailable(reason: "test"), at: first
+        )
+        let snapshot = controller.accept(
+            sample(energy: Double.greatestFiniteMagnitude, timestamp: first),
+            memory: .unavailable(reason: "test"), temperatures: .unavailable(reason: "test"),
+            fans: .unavailable(reason: "test"), at: first
+        )
+
+        guard case .unavailable = snapshot.power else {
+            return XCTFail("Overflowing rate must not be displayed as zero")
+        }
+    }
+
     private func sample(
         energy: Double,
-        timestamp: Date,
+        timestamp: Date?,
         fastCores: [CoreReading] = [],
         slowCores: [CoreReading] = []
     ) -> PowerMetricsReading {

@@ -290,6 +290,73 @@ final class DashboardApplicationTests: XCTestCase {
         XCTAssertNotEqual(restored.c_lflag & tcflag_t(ICANON), 0)
     }
 
+    func testSIGQUITExitsNormallyAndRestoresTerminal() throws {
+        let pty = try makePTY(rows: 40, columns: 100)
+        defer { Darwin.close(pty.master); Darwin.close(pty.slave) }
+        _ = fcntl(pty.master, F_SETFL, fcntl(pty.master, F_GETFL) | O_NONBLOCK)
+        let fixture = try writeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        let application = DashboardApplication(
+            options: CLIOptions(),
+            terminal: TerminalSession(inputFD: pty.slave, outputFD: pty.slave),
+            runtime: DashboardRuntimeConfiguration(
+                samplerCommands: [fixtureCommand(fixture)], profilerCommand: nil,
+                watchesSignals: true, stallTimeoutOverride: 1
+            )
+        )
+        let finished = expectation(description: "SIGQUIT exits")
+        let result = LockedResult()
+
+        DispatchQueue.global().async {
+            do { try application.run() } catch { result.error = error }
+            finished.fulfill()
+        }
+        _ = waitForOutput(pty.master, containing: "Disk I/O", timeout: 3)
+        XCTAssertEqual(Darwin.kill(getpid(), SIGQUIT), 0)
+        wait(for: [finished], timeout: 1)
+
+        XCTAssertNil(result.error)
+        var restored = termios()
+        XCTAssertEqual(tcgetattr(pty.slave, &restored), 0)
+        XCTAssertNotEqual(restored.c_lflag & tcflag_t(ICANON), 0)
+    }
+
+    func testSIGWINCHImmediatelyRedrawsAndUndersizedTerminalStillQuits() throws {
+        let pty = try makePTY(rows: 40, columns: 100)
+        defer { Darwin.close(pty.master); Darwin.close(pty.slave) }
+        _ = fcntl(pty.master, F_SETFL, fcntl(pty.master, F_GETFL) | O_NONBLOCK)
+        let fixture = try writeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        let application = DashboardApplication(
+            options: CLIOptions(),
+            terminal: TerminalSession(inputFD: pty.slave, outputFD: pty.slave),
+            runtime: DashboardRuntimeConfiguration(
+                samplerCommands: [fixtureCommand(fixture)], profilerCommand: nil,
+                watchesSignals: true, stallTimeoutOverride: 1
+            )
+        )
+        let finished = expectation(description: "resized dashboard quits")
+        let result = LockedResult()
+        DispatchQueue.global().async {
+            do { try application.run() } catch { result.error = error }
+            finished.fulfill()
+        }
+        _ = waitForOutput(pty.master, containing: "Disk I/O", timeout: 3)
+        _ = readAll(pty.master)
+        var small = winsize(ws_row: 9, ws_col: 39, ws_xpixel: 0, ws_ypixel: 0)
+        XCTAssertEqual(ioctl(pty.slave, TIOCSWINSZ, &small), 0)
+        XCTAssertEqual(Darwin.kill(getpid(), SIGWINCH), 0)
+        let resized = waitForOutput(pty.master, containing: "Terminal too small", timeout: 1)
+        let resizedText = String(decoding: resized, as: UTF8.self)
+        XCTAssertTrue(resizedText.contains("Terminal too small"))
+        XCTAssertTrue(resizedText.contains("\u{1B}[J"))
+
+        var quit = UInt8(ascii: "q")
+        XCTAssertEqual(Darwin.write(pty.master, &quit, 1), 1)
+        wait(for: [finished], timeout: 1)
+        XCTAssertNil(result.error)
+    }
+
     private func writeFixture() throws -> URL {
         let value: [String: Any] = [
             "timestamp": Date(timeIntervalSince1970: 1_000),

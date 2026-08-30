@@ -113,6 +113,15 @@ final class PowerMetricsDecoderTests: XCTestCase {
         XCTAssertNil(sample?.disk)
     }
 
+    func testMissingGPUFrequencyDoesNotBecomeFreshZero() throws {
+        var value = validSample()
+        value["gpu"] = ["idle_ratio": 0.5]
+
+        let sample = PowerMetricsDecoder(topology: topology).decode(plistRecord: try plist(value))
+
+        XCTAssertNil(sample?.gpu)
+    }
+
     func testMissingThermalSectionIsUnavailableInsteadOfUnknownString() throws {
         var fixture = validSample()
         fixture.removeValue(forKey: "thermal_pressure")
@@ -128,6 +137,15 @@ final class PowerMetricsDecoderTests: XCTestCase {
         ))
     }
 
+    func testStructurallyEmptyPlistIsNotCountedAsAValidSample() throws {
+        XCTAssertNil(PowerMetricsDecoder(topology: topology).decode(
+            plistRecord: try plist([:])
+        ))
+        XCTAssertNil(PowerMetricsDecoder(topology: topology).decode(
+            plistRecord: try plist(["timestamp": Date()])
+        ))
+    }
+
     func testGPUFrequencyConvertsHertzOnlyWhenNeeded() throws {
         var value = validSample()
         value["gpu"] = ["idle_ratio": 0.5, "freq_hz": 1_200_000_000.0]
@@ -137,6 +155,74 @@ final class PowerMetricsDecoderTests: XCTestCase {
         )
 
         XCTAssertEqual(sample?.gpu?.frequencyMHz, 1_200)
+    }
+
+    func testMalformedCPUCoresDoNotProduceFreshZeroCPU() throws {
+        var value = validSample()
+        var processor = value["processor"] as! [String: Any]
+        processor["clusters"] = [[
+            "name": "S-Cluster",
+            "cpus": [["cpu": 0, "freq_hz": 4_000_000_000.0]],
+        ]]
+        value["processor"] = processor
+
+        let sample = PowerMetricsDecoder(topology: topology).decode(plistRecord: try plist(value))
+
+        XCTAssertNil(sample?.cpu)
+        XCTAssertNotNil(sample?.gpu)
+        XCTAssertNotNil(sample?.network)
+    }
+
+    func testNegativeCountersRatesAndBlankThermalAreUnavailable() throws {
+        var value = validSample()
+        var processor = value["processor"] as! [String: Any]
+        processor["cpu_energy"] = -1.0
+        value["processor"] = processor
+        value["network"] = ["ibyte_rate": -1.0, "obyte_rate": 2_048.0]
+        value["disk"] = ["rbytes_per_s": 4_096.0, "wbytes_per_s": -1.0]
+        value["thermal_pressure"] = "  "
+
+        let sample = PowerMetricsDecoder(topology: topology).decode(plistRecord: try plist(value))
+
+        XCTAssertNotNil(sample?.cpu)
+        XCTAssertNil(sample?.cpu?.power)
+        XCTAssertNil(sample?.network)
+        XCTAssertNil(sample?.disk)
+        XCTAssertNil(sample?.thermalPressure)
+    }
+
+    func testOutOfRangeIdleRatiosAreRejected() throws {
+        var value = validSample()
+        var processor = value["processor"] as! [String: Any]
+        processor["clusters"] = [[
+            "name": "S-Cluster",
+            "cpus": [["cpu": 0, "idle_ratio": 1.5, "freq_hz": 4_000_000_000.0]],
+        ]]
+        value["processor"] = processor
+        value["gpu"] = ["idle_ratio": -0.5, "freq_hz": 1_000.0]
+
+        let sample = PowerMetricsDecoder(topology: topology).decode(plistRecord: try plist(value))
+
+        XCTAssertNil(sample?.cpu)
+        XCTAssertNil(sample?.gpu)
+    }
+
+    func testHugeFiniteFrequenciesAreRejectedWithoutIntegerTrap() throws {
+        var value = validSample()
+        var processor = value["processor"] as! [String: Any]
+        processor["clusters"] = [[
+            "name": "S-Cluster",
+            "freq_hz": 1e300,
+            "cpus": [["cpu": 0, "idle_ratio": 0.5, "freq_hz": 1e300]],
+        ]]
+        value["processor"] = processor
+        value["gpu"] = ["idle_ratio": 0.5, "freq_hz": 1e300]
+
+        let sample = PowerMetricsDecoder(topology: topology).decode(plistRecord: try plist(value))
+
+        XCTAssertNil(sample?.cpu)
+        XCTAssertNil(sample?.gpu)
+        XCTAssertNotNil(sample?.network)
     }
 }
 

@@ -30,6 +30,53 @@ public struct TemperatureReading: Equatable, Sendable {
     }
 }
 
+struct HIDTemperatureFreshnessCache {
+    private struct Entry {
+        let displayName: String
+        var celsius: Double
+        var generation: Int
+    }
+
+    private var generation = 0
+    private var entries: [String: Entry] = [:]
+
+    mutating func reset() {
+        generation = 0
+        entries.removeAll(keepingCapacity: true)
+    }
+
+    mutating func beginWarmRead() {
+        generation &+= 1
+    }
+
+    mutating func record(identity: String, displayName: String, celsius: Double) {
+        entries[identity] = Entry(
+            displayName: displayName,
+            celsius: celsius,
+            generation: generation
+        )
+    }
+
+    func readings(maximumAge: Int) -> [TemperatureReading] {
+        let live = entries.values.compactMap { entry -> TemperatureReading? in
+            guard generation - entry.generation <= maximumAge else { return nil }
+            return TemperatureReading(name: entry.displayName, celsius: entry.celsius)
+        }
+        return TemperatureReading.deduplicatedByName(live)
+    }
+}
+
+enum HIDDiscoveryOutcome {
+    static func finish(
+        sawReachableEmptyClient: Bool,
+        sawAnyServices: Bool
+    ) -> NativeCollectorResult<[TemperatureReading]> {
+        if sawAnyServices { return .unavailable(reason: "IOHID temperature sensors unreadable") }
+        if sawReachableEmptyClient { return .value([]) }
+        return .unavailable(reason: "no IOHID temperature sensors found")
+    }
+}
+
 public struct FanReading: Equatable, Sendable {
     public let index: Int
     public let rpm: Double
