@@ -4,3 +4,4 @@ __pycache__/
 silitop-temps
 silitop-fans
 *.o
+.worktrees/
