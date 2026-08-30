@@ -49,18 +49,24 @@ public struct DashboardStateController {
             previous: previousTimestamp,
             fallback: Double(intervalSeconds)
         )
-        previousTimestamp = reading.timestamp ?? previousTimestamp
+        // A timestamp-less record breaks continuity. Keeping the older
+        // timestamp would make the next energy sample span two intervals.
+        previousTimestamp = reading.timestamp
 
         let cpuState: MetricState<CPUReading>
         let powerState: MetricState<PowerReading>
         if var cpu = reading.cpu {
             applyFrequencyFallback(to: &cpu)
             cpuState = .fresh(cpu, observedAt: now)
-            if let energy = cpu.power {
-                let cpuWatts = finiteRate(energy.cpuJoules, elapsed: elapsed)
-                let gpuWatts = finiteRate(energy.gpuJoules, elapsed: elapsed)
-                let aneWatts = finiteRate(energy.aneJoules, elapsed: elapsed)
-                let packageWatts = max(0, energy.packageWatts)
+            if
+                let energy = cpu.power,
+                let cpuWatts = finiteRate(energy.cpuJoules, elapsed: elapsed),
+                let gpuWatts = finiteRate(energy.gpuJoules, elapsed: elapsed),
+                let aneWatts = finiteRate(energy.aneJoules, elapsed: elapsed),
+                energy.packageWatts.isFinite,
+                energy.packageWatts >= 0
+            {
+                let packageWatts = energy.packageWatts
 
                 Self.append(cpuWatts, to: &cpuAverageSamples, capacity: averageCapacity)
                 Self.append(gpuWatts, to: &gpuAverageSamples, capacity: averageCapacity)
@@ -82,7 +88,7 @@ public struct DashboardStateController {
                     packagePeakWatts: packagePeak
                 ), observedAt: now)
             } else {
-                powerState = .unavailable(reason: "processor energy fields missing")
+                powerState = .unavailable(reason: "processor energy fields missing or invalid")
             }
         } else {
             cpuState = .unavailable(reason: "processor section missing")
@@ -158,27 +164,39 @@ public struct DashboardStateController {
         cache: inout [String: Int],
         tierFrequency: inout Int
     ) {
+        // Learn every frequency in the current tier before filling gaps so
+        // the result is independent of core order on the first frame.
+        let currentTierFrequency = cores.lazy
+            .map(\.frequencyMHz)
+            .filter { $0 > 0 }
+            .max() ?? 0
+        for core in cores where core.frequencyMHz > 0 {
+            cache["\(tier):\(core.id)"] = core.frequencyMHz
+            tierFrequency = max(tierFrequency, core.frequencyMHz)
+        }
         for index in cores.indices {
             let key = "\(tier):\(cores[index].id)"
-            if cores[index].frequencyMHz > 0 {
-                cache[key] = cores[index].frequencyMHz
-                tierFrequency = max(tierFrequency, cores[index].frequencyMHz)
-            } else if let cached = cache[key], cached > 0 {
+            if cores[index].frequencyMHz == 0, let cached = cache[key], cached > 0 {
                 cores[index].frequencyMHz = cached
-            } else if tierFrequency > 0 {
+            } else if cores[index].frequencyMHz == 0, currentTierFrequency > 0 {
+                cores[index].frequencyMHz = currentTierFrequency
+            } else if cores[index].frequencyMHz == 0, tierFrequency > 0 {
                 cores[index].frequencyMHz = tierFrequency
             }
         }
     }
 
-    private func finiteRate(_ energy: Double, elapsed: Double) -> Double {
-        let result = max(0, energy) / max(0.001, elapsed)
-        return result.isFinite ? result : 0
+    private func finiteRate(_ energy: Double, elapsed: Double) -> Double? {
+        guard energy.isFinite, energy >= 0, elapsed.isFinite else { return nil }
+        let result = energy / max(0.001, elapsed)
+        return result.isFinite ? result : nil
     }
 
     private func average(_ values: [Double]) -> Double {
         guard !values.isEmpty else { return 0 }
-        return values.reduce(0, +) / Double(values.count)
+        let count = Double(values.count)
+        let result = values.reduce(0) { $0 + $1 / count }
+        return result.isFinite ? result : values.max() ?? 0
     }
 
     private static func append(_ value: Double, to values: inout [Double], capacity: Int) {

@@ -3,6 +3,40 @@ import XCTest
 @testable import SiliTopCore
 
 final class SensorContractsTests: XCTestCase {
+    func testWarmTemperatureCacheExpiresAnIndividuallyDeadSensor() {
+        var cache = HIDTemperatureFreshnessCache()
+        cache.record(identity: "live@1", displayName: "live", celsius: 50)
+        cache.record(identity: "dead@2", displayName: "dead", celsius: 60)
+
+        for value in 51...53 {
+            cache.beginWarmRead()
+            cache.record(identity: "live@1", displayName: "live", celsius: Double(value))
+        }
+
+        XCTAssertEqual(cache.readings(maximumAge: 2), [
+            TemperatureReading(name: "live", celsius: 53),
+        ])
+    }
+
+    func testReachableClientWithNoServicesIsAConfirmedEmptyReading() {
+        XCTAssertEqual(
+            HIDDiscoveryOutcome.finish(sawReachableEmptyClient: true, sawAnyServices: false),
+            .value([])
+        )
+        XCTAssertEqual(
+            HIDDiscoveryOutcome.finish(sawReachableEmptyClient: false, sawAnyServices: false),
+            .unavailable(reason: "no IOHID temperature sensors found")
+        )
+        XCTAssertEqual(
+            HIDDiscoveryOutcome.finish(sawReachableEmptyClient: true, sawAnyServices: true),
+            .unavailable(reason: "IOHID temperature sensors unreadable")
+        )
+    }
+
+    func testTemperatureCacheAgeCoversEntireRoundRobin() {
+        XCTAssertEqual(HIDTemperatureCollector.maximumCacheAge(serviceCount: 25), 4)
+    }
+
     func testTemperatureDisplayNamesAreUniqueWithLastReadingWinning() {
         let readings = TemperatureReading.deduplicatedByName([
             TemperatureReading(name: "battery", celsius: 30),

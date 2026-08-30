@@ -88,7 +88,12 @@ public final class TerminalSession {
         originalInputFlags = inputFlags
         originalOutputFlags = outputFlags
         active = true
-        try write(Data("\u{1B}[?1049h\u{1B}[?25l\u{1B}[2J\u{1B}[H".utf8))
+        do {
+            try write(Data("\u{1B}[?1049h\u{1B}[?25l\u{1B}[2J\u{1B}[H".utf8))
+        } catch {
+            restore()
+            throw error
+        }
     }
 
     public func write(_ data: Data) throws {
@@ -120,6 +125,10 @@ public final class TerminalSession {
 
     public func restore() {
         guard active else { return }
+        // A renderer write may have filled the terminal queue. Drop that
+        // incomplete frame so the small, critical cleanup sequence is not
+        // discarded by the bounded nonblocking writer.
+        _ = tcflush(outputFD, TCOFLUSH)
         _ = try? write(Data("\u{1B}[?25h\u{1B}[?1049l".utf8))
         if var attributes = originalAttributes {
             // Restoration must not wait for a terminal emulator to drain its

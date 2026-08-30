@@ -46,10 +46,12 @@ final class TerminalSessionTests: XCTestCase {
         let session = TerminalSession(inputFD: pty.slave, outputFD: pty.slave)
 
         try session.begin()
+        usleep(5_000)
+        let entered = readAll(pty.master)
         session.restore()
         session.restore()
         usleep(5_000)
-        let output = String(decoding: readAll(pty.master), as: UTF8.self)
+        let output = String(decoding: entered + readAll(pty.master), as: UTF8.self)
 
         XCTAssertTrue(output.contains("\u{1B}[?1049h"))
         XCTAssertTrue(output.contains("\u{1B}[?25l"))
@@ -61,15 +63,20 @@ final class TerminalSessionTests: XCTestCase {
     func testBackpressuredOutputReturnsWithoutBusySpinning() throws {
         let pty = try makePTY()
         defer { Darwin.close(pty.master); Darwin.close(pty.slave) }
+        _ = fcntl(pty.master, F_SETFL, fcntl(pty.master, F_GETFL) | O_NONBLOCK)
         let session = TerminalSession(inputFD: pty.slave, outputFD: pty.slave)
         try session.begin()
+        _ = readAll(pty.master)
 
         let started = ContinuousClock.now
         try session.write(Data(repeating: UInt8(ascii: "x"), count: 1_000_000))
         let elapsed = started.duration(to: .now)
         session.restore()
+        usleep(5_000)
+        let output = String(decoding: readAll(pty.master), as: UTF8.self)
 
         XCTAssertLessThan(elapsed, .milliseconds(100))
+        XCTAssertTrue(output.contains("\u{1B}[?25h\u{1B}[?1049l"))
     }
 
     func testNonTTYIsRejectedBeforeMutation() {

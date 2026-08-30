@@ -43,6 +43,8 @@ public final class SpawnedChild {
 
         var actions: posix_spawn_file_actions_t? = nil
         var initializedActions = false
+        var attributes: posix_spawnattr_t? = nil
+        var initializedAttributes = false
         var childPID: pid_t = 0
         var spawnCode: Int32 = EINVAL
         let values = [executable] + arguments
@@ -52,6 +54,7 @@ public final class SpawnedChild {
         defer {
             argv.forEach { free($0) }
             if initializedActions { posix_spawn_file_actions_destroy(&actions) }
+            if initializedAttributes { posix_spawnattr_destroy(&attributes) }
         }
 
         let initCode = posix_spawn_file_actions_init(&actions)
@@ -61,6 +64,30 @@ public final class SpawnedChild {
             throw ChildSpawnError(executable: executable, code: initCode)
         }
         initializedActions = true
+
+        let attributeCode = posix_spawnattr_init(&attributes)
+        guard attributeCode == 0 else {
+            closePipe(stdoutPipe)
+            closePipe(stderrPipe)
+            throw ChildSpawnError(executable: executable, code: attributeCode)
+        }
+        initializedAttributes = true
+        var defaultSignals = sigset_t()
+        sigemptyset(&defaultSignals)
+        for number in [SIGINT, SIGTERM, SIGHUP, SIGWINCH, SIGQUIT, SIGTSTP] {
+            sigaddset(&defaultSignals, number)
+        }
+        let signalCode = posix_spawnattr_setsigdefault(&attributes, &defaultSignals)
+        let attributeFlags = Int16(POSIX_SPAWN_SETSIGDEF)
+        let flagsCode = posix_spawnattr_setflags(&attributes, attributeFlags)
+        guard signalCode == 0, flagsCode == 0 else {
+            closePipe(stdoutPipe)
+            closePipe(stderrPipe)
+            throw ChildSpawnError(
+                executable: executable,
+                code: signalCode == 0 ? flagsCode : signalCode
+            )
+        }
 
         posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
         posix_spawn_file_actions_adddup2(&actions, stdoutPipe[1], STDOUT_FILENO)
@@ -72,7 +99,7 @@ public final class SpawnedChild {
 
         spawnCode = executable.withCString { path in
             argv.withUnsafeMutableBufferPointer { buffer in
-                posix_spawn(&childPID, path, &actions, nil, buffer.baseAddress, environ)
+                posix_spawn(&childPID, path, &actions, &attributes, buffer.baseAddress, environ)
             }
         }
 

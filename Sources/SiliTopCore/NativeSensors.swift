@@ -66,10 +66,14 @@ public final class HIDTemperatureCollector {
     private let symbols: HIDSymbols?
     private var client: AnyObject?
     private var services: [CachedHIDService] = []
-    private var lastValues: [String: Double] = [:]
+    private var freshnessCache = HIDTemperatureFreshnessCache()
     private var nextServiceIndex = 0
     private let temperatureType: Int64 = 15
-    private let servicesPerWarmRead = 8
+    private static let servicesPerWarmRead = 8
+
+    static func maximumCacheAge(serviceCount: Int) -> Int {
+        max(1, (max(0, serviceCount) + servicesPerWarmRead - 1) / servicesPerWarmRead)
+    }
 
     public init() {
         symbols = HIDSymbols()
@@ -84,8 +88,10 @@ public final class HIDTemperatureCollector {
         }
         client = nil
         services = []
-        lastValues = [:]
+        freshnessCache.reset()
         nextServiceIndex = 0
+        var sawReachableEmptyClient = false
+        var sawAnyServices = false
         for clientType in Int32(0)...Int32(3) {
             guard let pointer = clientType == 0
                 ? symbols.create(kCFAllocatorDefault)
@@ -104,19 +110,27 @@ public final class HIDTemperatureCollector {
             let candidateServices = (array as [AnyObject]).map { service in
                 cachedService(service, using: symbols)
             }
+            if candidateServices.isEmpty {
+                sawReachableEmptyClient = true
+                continue
+            }
+            sawAnyServices = true
             client = candidate
             services = candidateServices
-            lastValues = [:]
+            freshnessCache.reset()
             nextServiceIndex = 0
             if let readings = readCurrentServices(using: symbols, fullScan: true), !readings.isEmpty {
                 return .value(readings)
             }
             client = nil
             services = []
-            lastValues = [:]
+            freshnessCache.reset()
             nextServiceIndex = 0
         }
-        return .unavailable(reason: "no IOHID temperature sensors found")
+        return HIDDiscoveryOutcome.finish(
+            sawReachableEmptyClient: sawReachableEmptyClient,
+            sawAnyServices: sawAnyServices
+        )
     }
 
     private func readCurrentServices(
@@ -124,7 +138,8 @@ public final class HIDTemperatureCollector {
         fullScan: Bool
     ) -> [TemperatureReading]? {
         guard client != nil, !services.isEmpty else { return nil }
-        let count = fullScan ? services.count : min(servicesPerWarmRead, services.count)
+        if !fullScan { freshnessCache.beginWarmRead() }
+        let count = fullScan ? services.count : min(Self.servicesPerWarmRead, services.count)
         var indices: [Int] = []
         indices.reserveCapacity(count)
         for offset in 0..<count {
@@ -143,14 +158,16 @@ public final class HIDTemperatureCollector {
             let event = Unmanaged<AnyObject>.fromOpaque(eventPointer).takeRetainedValue()
             let value = symbols.getFloatValue(Unmanaged.passUnretained(event).toOpaque(), field)
             if value.isFinite, value > 0, value < 150 {
-                lastValues[service.displayName] = value
+                freshnessCache.record(
+                    identity: service.identity,
+                    displayName: service.displayName,
+                    celsius: value
+                )
                 updateCount += 1
             }
         }
         guard updateCount > 0 else { return nil }
-        return lastValues.keys.sorted().compactMap { name in
-            lastValues[name].map { TemperatureReading(name: name, celsius: $0) }
-        }
+        return freshnessCache.readings(maximumAge: Self.maximumCacheAge(serviceCount: services.count))
     }
 
     private func cachedService(_ service: AnyObject, using symbols: HIDSymbols) -> CachedHIDService {

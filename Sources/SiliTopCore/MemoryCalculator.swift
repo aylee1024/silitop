@@ -41,8 +41,8 @@ public struct MemoryReading: Equatable, Sendable {
     public let compressedGiB: Double
     public let appGiB: Double
     public let cachedGiB: Double
-    public let swapTotalGiB: Double
-    public let swapUsedGiB: Double
+    public let swapTotalGiB: Double?
+    public let swapUsedGiB: Double?
 }
 
 public enum MemoryCalculator {
@@ -82,8 +82,8 @@ public enum MemoryCalculator {
             compressedGiB: gibibytes(pages: statistics.compressorPages, pageSize: statistics.pageSize),
             appGiB: gibibytes(pages: statistics.anonymousPages, pageSize: statistics.pageSize),
             cachedGiB: gibibytes(pages: statistics.fileBackedPages, pageSize: statistics.pageSize),
-            swapTotalGiB: gibibytes(bytes: swap?.totalBytes ?? 0),
-            swapUsedGiB: gibibytes(bytes: swap?.usedBytes ?? 0)
+            swapTotalGiB: swap.map { gibibytes(bytes: $0.totalBytes) },
+            swapUsedGiB: swap.map { gibibytes(bytes: $0.usedBytes) }
         )
     }
 }

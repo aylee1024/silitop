@@ -28,6 +28,9 @@ final class CLIOptionsTests: XCTestCase {
         assertUsageError(["--interval", "0"], contains: "--interval")
         assertUsageError(["--interval", "-1"], contains: "--interval")
         assertUsageError(["--interval", "later"], contains: "--interval")
+        assertUsageError([
+            "--interval", String(Int.max), "--avg", String(Int.max),
+        ], contains: "too large")
     }
 
     func testAverageMustCoverAtLeastOneInterval() {

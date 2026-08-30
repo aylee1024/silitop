@@ -34,8 +34,8 @@ final class AdditionalParityContractsTests: XCTestCase {
             totalBytes: 16_384 * 100_000,
             swap: nil
         )
-        XCTAssertEqual(reading.swapTotalGiB, 0)
-        XCTAssertEqual(reading.swapUsedGiB, 0)
+        XCTAssertNil(reading.swapTotalGiB)
+        XCTAssertNil(reading.swapUsedGiB)
         XCTAssertGreaterThan(reading.usedGiB, 0)
     }
 

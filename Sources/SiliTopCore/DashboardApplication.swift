@@ -91,7 +91,7 @@ public final class DashboardApplication: @unchecked Sendable {
         try queue.watchRead(terminal.inputFD)
         try queue.watchTimer(identifier: Self.stallTimerIdentifier, milliseconds: 100, repeating: true)
         if runtime.watchesSignals {
-            for number in [SIGWINCH, SIGINT, SIGTERM, SIGHUP] {
+            for number in [SIGWINCH, SIGINT, SIGTERM, SIGHUP, SIGQUIT] {
                 try queue.watchSignal(number)
             }
         }
@@ -141,7 +141,7 @@ public final class DashboardApplication: @unchecked Sendable {
             let body = lines.prefix(max(1, size.rows))
                 .map { DisplayWidth.fit($0, to: width) }
                 .joined(separator: "\n") + "\n"
-            try terminal.write(Data(("\u{1B}[H" + body).utf8))
+            try terminal.write(Data(("\u{1B}[H" + body + "\u{1B}[J").utf8))
         }
 
         func redraw() throws {
@@ -325,7 +325,7 @@ public final class DashboardApplication: @unchecked Sendable {
                 case .signal(SIGWINCH):
                     try redraw()
 
-                case .signal(SIGINT), .signal(SIGTERM), .signal(SIGHUP):
+                case .signal(SIGINT), .signal(SIGTERM), .signal(SIGHUP), .signal(SIGQUIT):
                     return
 
                 case let .error(identifier, code):

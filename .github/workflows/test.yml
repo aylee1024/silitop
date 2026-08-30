@@ -34,7 +34,7 @@ jobs:
       - name: Enforce stripped binary size gate
         run: |
           binary="$(swift build -c release --show-bin-path)/silitop"
-          strip -x "${binary}"
+          strip "${binary}"
           bytes="$(stat -f %z "${binary}")"
           test "${bytes}" -le 400150
 

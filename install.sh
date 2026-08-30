@@ -64,7 +64,7 @@ if [[ ! -x "${BINARY}" ]]; then
     echo "Error: release build did not produce ${BINARY}." >&2
     exit 1
 fi
-strip -x "${BINARY}"
+strip "${BINARY}"
 echo "      Done."
 
 echo "[2/3] Installing atomically to ${INSTALL_DIR}..."
