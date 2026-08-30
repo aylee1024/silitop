@@ -12,25 +12,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Show Python and macOS versions
+      - name: Show toolchain and macOS versions
         run: |
-          python3 --version
+          swift --version
           sw_vers
 
-      - name: Run unit tests
+      - name: Run native tests
         env:
-          PYTHONDONTWRITEBYTECODE: "1"
-        run: python3 -m unittest discover tests -v
+          CI: "1"
+        run: swift test
 
-      - name: Sanity check Swift compilation
+      - name: Build release executable
+        run: swift build -c release --product silitop
+
+      - name: Verify macOS 13 deployment target
         run: |
-          swiftc -O silitop-temps.swift -o /tmp/silitop-temps-check
-          swiftc -O silitop-fans.swift  -o /tmp/silitop-fans-check
-          # Verify v1 protocol header is emitted (runners may not have
-          # AppleSMC / IOHID access, so we tolerate STATUS|smc_unavailable
-          # or STATUS|client_unavailable as long as the header is present).
-          /tmp/silitop-temps-check 2>/dev/null | head -1 | grep -qx "silitop-temps v1"
-          /tmp/silitop-fans-check  2>/dev/null | head -1 | grep -qx "silitop-fans v1"
+          binary="$(swift build -c release --show-bin-path)/silitop"
+          minos="$(xcrun vtool -show-build "${binary}" | awk '/minos/{print $2; exit}')"
+          test "${minos}" = "13.0"
 
-      - name: Syntax check shell scripts
+      - name: Enforce stripped binary size gate
+        run: |
+          binary="$(swift build -c release --show-bin-path)/silitop"
+          strip -x "${binary}"
+          bytes="$(stat -f %z "${binary}")"
+          test "${bytes}" -le 400150
+
+      - name: Validate installer
         run: bash -n install.sh
