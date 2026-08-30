@@ -100,6 +100,36 @@ final class TopologyDetectorTests: XCTestCase {
         XCTAssertEqual(reading?.cpu?.slowCores.map(\.id), [6])
     }
 
+    func testProfilerCorrectsM5TierLabelsWithoutOverwritingExistingCounts() throws {
+        let profiler: [[String: Any]] = [[
+            "_dataType": "SPHardwareDataType",
+            "_items": [[
+                "chip_type": "Apple M5 Pro",
+                "number_processors": "proc 18:6:0:12",
+            ]],
+        ]]
+        let data = try PropertyListSerialization.data(fromPropertyList: profiler, format: .xml, options: 0)
+        let initial = Topology(
+            name: nil,
+            fastLabel: "Performance",
+            slowLabel: "Efficiency",
+            fastPrefix: "P",
+            slowPrefix: "E",
+            fastCoreCount: 5,
+            slowCoreCount: 11,
+            gpuCoreCount: nil
+        )
+
+        let merged = SystemProfilerTopologyMerger.merge(data: data, into: initial)
+
+        XCTAssertEqual(merged.fastLabel, "Super")
+        XCTAssertEqual(merged.slowLabel, "Performance")
+        XCTAssertEqual(merged.fastPrefix, "S")
+        XCTAssertEqual(merged.slowPrefix, "P")
+        XCTAssertEqual(merged.fastCoreCount, 5)
+        XCTAssertEqual(merged.slowCoreCount, 11)
+    }
+
     func testTotalDetectionFailureUsesUnknownsNotFabricatedCounts() {
         let topology = TopologyDetector(sysctl: { _ in nil }).detect()
 

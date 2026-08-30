@@ -66,15 +66,14 @@ public enum SystemProfilerTopologyMerger {
                     result.name = items.lazy.compactMap { nonempty($0["chip_type"] as? String) }.first
                     result.powerLimits = PowerLimits.forChip(named: result.name)
                 }
-                if result.fastCoreCount == nil || result.slowCoreCount == nil,
-                   let counts = items.lazy.compactMap({ profilerTierCounts($0["number_processors"]) }).first {
+                if let counts = items.lazy.compactMap({ profilerTierCounts($0["number_processors"]) }).first {
                     let labels = profilerTierLabels(chipName: result.name)
                     result.fastLabel = labels.fast
                     result.slowLabel = labels.slow
                     result.fastPrefix = prefix(of: labels.fast, fallback: "P")
                     result.slowPrefix = prefix(of: labels.slow, fallback: "E")
-                    result.fastCoreCount = counts.fast
-                    result.slowCoreCount = counts.slow
+                    if result.fastCoreCount == nil { result.fastCoreCount = counts.fast }
+                    if result.slowCoreCount == nil { result.slowCoreCount = counts.slow }
                 }
             }
             if kind == "SPDisplaysDataType", result.gpuCoreCount == nil {

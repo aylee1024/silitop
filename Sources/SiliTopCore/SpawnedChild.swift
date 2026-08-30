@@ -124,6 +124,14 @@ public final class SpawnedChild {
         readAvailable(from: stderrFD, maximumBytes: maximumBytes)
     }
 
+    func closeStdout() {
+        closeDescriptor(&stdoutFD)
+    }
+
+    func closeStderr() {
+        closeDescriptor(&stderrFD)
+    }
+
     @discardableResult
     public func reapIfExited() -> Int32? {
         if reaped { return status }
@@ -159,14 +167,29 @@ public final class SpawnedChild {
     }
 
     private func closeDescriptors() {
-        if stdoutFD >= 0 {
-            Darwin.close(stdoutFD)
-            stdoutFD = -1
-        }
-        if stderrFD >= 0 {
-            Darwin.close(stderrFD)
-            stderrFD = -1
-        }
+        closeStdout()
+        closeStderr()
+    }
+}
+
+struct SpawnedChildEventSnapshot {
+    let child: SpawnedChild
+    let pid: pid_t
+    let stdoutFD: Int32
+    let stderrFD: Int32
+
+    init(_ child: SpawnedChild) {
+        self.child = child
+        pid = child.pid
+        stdoutFD = child.stdoutFD
+        stderrFD = child.stderrFD
+    }
+}
+
+private func closeDescriptor(_ descriptor: inout Int32) {
+    if descriptor >= 0 {
+        Darwin.close(descriptor)
+        descriptor = -1
     }
 }
 
