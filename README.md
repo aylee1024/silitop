@@ -71,7 +71,7 @@ Press `q` or `Esc` to quit.
 silitop (Python, curses UI)
   |
   |-- powermetrics subprocess (cpu_power, gpu_power, thermal, network, disk)
-  |     writes plist to /tmp/silitop_pm*
+  |     streams plist samples through a bounded in-memory pipe
   |
   |-- silitop-temps (compiled Swift binary)
   |     reads IOHIDEventSystemClient temperature sensors
