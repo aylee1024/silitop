@@ -16,7 +16,6 @@ import signal
 import stat
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections import deque
@@ -31,6 +30,7 @@ POWERMETRICS = "/usr/bin/powermetrics"
 NICE = "/usr/bin/nice"
 VM_STAT = "/usr/bin/vm_stat"
 SYSTEM_HELPER_DIR = "/usr/local/bin"
+MAX_PM_FRAME_BYTES = 4 * 1024 * 1024
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -159,14 +159,8 @@ def get_soc_info():
     return info
 
 
-def run_powermetrics(pm_path, interval=1000):
-    """Start a powermetrics subprocess writing plist samples to pm_path.
-
-    The caller allocates pm_path (typically via tempfile.mkstemp) so we
-    never glob a shared prefix and never race with other instances.
-    Raises RuntimeError if every sampler set fails to stay alive past the
-    1.5-second probe window. Returns the live Popen on success.
-    """
+def run_powermetrics(interval=1000):
+    """Start powermetrics with unbuffered plist output on stdout."""
     samplers_options = [
         "cpu_power,gpu_power,thermal,network,disk,smc",
         "cpu_power,gpu_power,thermal,network,disk",
@@ -176,8 +170,8 @@ def run_powermetrics(pm_path, interval=1000):
         cmd = [
             NICE, "-n", "10", POWERMETRICS,
             "--samplers", samplers,
-            "-o", pm_path,
             "-f", "plist",
+            "--buffer-size", "0",
             "-i", str(interval),
         ]
         try:
@@ -201,24 +195,8 @@ def run_powermetrics(pm_path, interval=1000):
     )
 
 
-def _setup_pm_path():
-    """Create a unique, attacker-unguessable plist path for powermetrics.
-
-    Uses tempfile.mkstemp so /tmp predictability and the cross-instance
-    glob-delete bug from the prior implementation are both eliminated.
-    """
-    pm_fd, pm_path = tempfile.mkstemp(prefix="silitop_pm_", dir="/tmp")
-    os.close(pm_fd)
-    return pm_path
-
-
-def _cleanup_pm(pm_proc, pm_path):
-    """Terminate the powermetrics subprocess and remove its plist file.
-
-    Idempotent and safe for any combination of (pm_proc, pm_path) being
-    None or already-dead. Called from main()'s finally block; SIGTERM
-    delivery between Popen and assignment is tolerated.
-    """
+def _cleanup_pm(pm_proc):
+    """Stop powermetrics and close its pipes, including after startup failure."""
     if pm_proc is not None:
         try:
             pm_proc.terminate()
@@ -234,40 +212,76 @@ def _cleanup_pm(pm_proc, pm_path):
                 pass
         except (ProcessLookupError, OSError):
             pass
-    if pm_path:
+        for pipe in (pm_proc.stdin, pm_proc.stdout, pm_proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+
+
+class PowermetricsReader:
+    """Read complete NUL-separated plist samples without retaining history."""
+
+    def __init__(self, stdout, stderr=None):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.pending = bytearray()
+        self.stderr_tail = bytearray()
+        os.set_blocking(stdout.fileno(), False)
+        if stderr is not None:
+            os.set_blocking(stderr.fileno(), False)
+
+    def read_available(self):
+        latest = None
+        while True:
+            try:
+                chunk = os.read(self.stdout.fileno(), 65536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                raise RuntimeError("powermetrics output closed")
+            self.pending.extend(chunk)
+            frames = self.pending.split(b"\0")
+            self.pending = bytearray(frames.pop())
+            for frame in frames:
+                if frame:
+                    latest = self._parse(frame)
+            if self.pending:
+                # A complete plist may arrive before its separating NUL.
+                try:
+                    parsed = plistlib.loads(bytes(self.pending).strip())
+                except Exception:
+                    pass
+                else:
+                    if not isinstance(parsed, dict):
+                        raise RuntimeError("invalid powermetrics plist")
+                    latest = parsed
+                    self.pending.clear()
+            if len(self.pending) > MAX_PM_FRAME_BYTES:
+                raise RuntimeError("powermetrics sample exceeds 4 MiB")
+        if self.stderr is not None:
+            while True:
+                try:
+                    chunk = os.read(self.stderr.fileno(), 65536)
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    break
+                self.stderr_tail = (self.stderr_tail + chunk)[-8192:]
+        return latest
+
+    @staticmethod
+    def _parse(frame):
+        if len(frame) > MAX_PM_FRAME_BYTES:
+            raise RuntimeError("powermetrics sample exceeds 4 MiB")
         try:
-            os.unlink(pm_path)
-        except (FileNotFoundError, OSError):
-            pass
-
-
-def parse_powermetrics(path):
-    """Parse the most recent sample from the plist file written by powermetrics.
-
-    Reads only the tail of the file (last 64 KB) instead of the whole
-    thing, keeping each cycle O(1) regardless of how long the process
-    has been running.  Uses split+iterate (like the original) so that
-    a partially-written chunk is skipped gracefully.
-    """
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            if size == 0:
-                return None
-            f.seek(-min(size, 65536), 2)
-            data = f.read()
-    except (FileNotFoundError, OSError):
-        return None
-    chunks = data.split(b"\x00")
-    for chunk in reversed(chunks):
-        if not chunk:
-            continue
-        try:
-            return plistlib.loads(chunk)
-        except Exception:
-            continue
-    return None
+            parsed = plistlib.loads(frame.strip())
+        except Exception as exc:
+            raise RuntimeError("invalid powermetrics plist") from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError("invalid powermetrics plist")
+        return parsed
 
 
 def _is_efficiency(name, slow_prefix):
@@ -1017,19 +1031,15 @@ def main(stdscr, args):
         f"{g}GPU)"
     )
 
-    # SIGTERM (from launchd, tmux kill-session, sudo timeout, etc.) is
-    # otherwise lost: the default action exits Python without unwinding the
-    # finally block, leaving root powermetrics and /tmp files behind. Funnel
-    # SIGTERM through a threading.Event so the loop exits cleanly.
+    # SIGTERM must reach the finally block so the child process is stopped.
     _stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: _stop.set())
 
-    # Unique plist path per instance; never glob a shared prefix.
-    pm_path = _setup_pm_path()
     pm_proc = None
 
     try:
-        pm_proc = run_powermetrics(pm_path, interval=args.interval * 1000)
+        pm_proc = run_powermetrics(interval=args.interval * 1000)
+        pm_reader = PowermetricsReader(pm_proc.stdout, pm_proc.stderr)
 
         # One-time lookups
         total_mem_bytes = int(subprocess.check_output(
@@ -1082,10 +1092,8 @@ def main(stdscr, args):
                 stdscr.clear()
                 continue
 
-            # Detect dead powermetrics. Without this, the file stops advancing
-            # but parse_powermetrics keeps returning the last sample (read from
-            # the 64K tail), and the timestamp-dedupe path sleeps without ever
-            # surfacing the failure. The user would see frozen "live" numbers.
+            # Detect exit even when no new sample arrives, rather than leaving
+            # stale readings on screen.
             if pm_proc.poll() is not None:
                 stdscr.erase()
                 h, w = stdscr.getmaxyx()
@@ -1096,7 +1104,7 @@ def main(stdscr, args):
                 _stop.wait(2.0)
                 break
 
-            parsed = parse_powermetrics(pm_path)
+            parsed = pm_reader.read_available()
             if parsed is None:
                 if waiting:
                     stdscr.erase()
@@ -1606,7 +1614,7 @@ def main(stdscr, args):
         except curses.error:
             pass
     finally:
-        _cleanup_pm(pm_proc, pm_path)
+        _cleanup_pm(pm_proc)
 
 
 def entry():
