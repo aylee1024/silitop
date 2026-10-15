@@ -135,6 +135,10 @@ class InstallScriptShellTests(unittest.TestCase):
         contents = (ROOT / "install.sh").read_text()
         self.assertIn('--uninstall', contents)
 
+    def test_native_python_check_is_present(self):
+        contents = (ROOT / "install.sh").read_text()
+        self.assertIn('/usr/bin/python3', contents)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

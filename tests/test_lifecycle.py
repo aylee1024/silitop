@@ -164,5 +164,38 @@ class SigtermPlumbingTests(unittest.TestCase):
             signal.signal(signal.SIGTERM, prior)
 
 
+class ArchitectureGuardTests(unittest.TestCase):
+    """Under Rosetta or non-arm64 on Apple Silicon, _ensure_native_arm64() must
+    re-exec via arch -arm64 /usr/bin/python3."""
+
+    def test_reexecs_when_emulated_on_apple_silicon(self):
+        fake_run = mock.Mock(stdout="1\n")
+        with mock.patch("sys.platform", "darwin"), \
+             mock.patch.object(SILITOP.platform, "machine", return_value="x86_64"), \
+             mock.patch.object(SILITOP.subprocess, "run", return_value=fake_run), \
+             mock.patch.object(SILITOP.os, "execvp") as fake_exec:
+            SILITOP._ensure_native_arm64()
+            fake_exec.assert_called_once()
+            args = fake_exec.call_args[0]
+            self.assertEqual(args[0], "arch")
+            self.assertEqual(args[1][:3], ["arch", "-arm64", "/usr/bin/python3"])
+
+    def test_no_reexec_when_native_arm64(self):
+        with mock.patch("sys.platform", "darwin"), \
+             mock.patch.object(SILITOP.platform, "machine", return_value="arm64"), \
+             mock.patch.object(SILITOP.os, "execvp") as fake_exec:
+            SILITOP._ensure_native_arm64()
+            fake_exec.assert_not_called()
+
+    def test_no_reexec_on_intel_host(self):
+        fake_run = mock.Mock(stdout="0\n")
+        with mock.patch("sys.platform", "darwin"), \
+             mock.patch.object(SILITOP.platform, "machine", return_value="x86_64"), \
+             mock.patch.object(SILITOP.subprocess, "run", return_value=fake_run), \
+             mock.patch.object(SILITOP.os, "execvp") as fake_exec:
+            SILITOP._ensure_native_arm64()
+            fake_exec.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
