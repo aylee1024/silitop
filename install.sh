@@ -59,6 +59,10 @@ if ! command -v python3 &>/dev/null; then
     echo "Error: python3 not found." >&2
     exit 1
 fi
+if [[ ! -x "/usr/bin/python3" ]]; then
+    echo "Error: Native Apple Silicon /usr/bin/python3 not found." >&2
+    exit 1
+fi
 
 echo "[1/4] Compiling helpers..."
 swiftc -O silitop-temps.swift -o silitop-temps
