@@ -7,19 +7,25 @@ public struct DashboardRuntimeConfiguration: Sendable {
     public let watchesSignals: Bool
     public let stallTimeoutOverride: TimeInterval?
     public let profilerTimeoutOverride: TimeInterval?
+    public let fastFailureLimit: Int
+    public let fastFailureWindow: TimeInterval
 
     public init(
         samplerCommands: [ChildCommand],
         profilerCommand: ChildCommand?,
         watchesSignals: Bool = true,
         stallTimeoutOverride: TimeInterval? = nil,
-        profilerTimeoutOverride: TimeInterval? = nil
+        profilerTimeoutOverride: TimeInterval? = nil,
+        fastFailureLimit: Int = 3,
+        fastFailureWindow: TimeInterval = 1
     ) {
         self.samplerCommands = samplerCommands
         self.profilerCommand = profilerCommand
         self.watchesSignals = watchesSignals
         self.stallTimeoutOverride = stallTimeoutOverride
         self.profilerTimeoutOverride = profilerTimeoutOverride
+        self.fastFailureLimit = max(1, fastFailureLimit)
+        self.fastFailureWindow = fastFailureWindow
     }
 
     public static func production(options: CLIOptions) -> DashboardRuntimeConfiguration {
@@ -28,10 +34,7 @@ public struct DashboardRuntimeConfiguration: Sendable {
                 PowerMetricsCommand(intervalSeconds: options.intervalSeconds, samplerSet: .full).childCommand,
                 PowerMetricsCommand(intervalSeconds: options.intervalSeconds, samplerSet: .essential).childCommand,
             ],
-            profilerCommand: ChildCommand(
-                executable: "/usr/sbin/system_profiler",
-                arguments: ["SPHardwareDataType", "SPDisplaysDataType", "-xml", "-detailLevel", "mini"]
-            )
+            profilerCommand: nil
         )
     }
 }
@@ -98,7 +101,8 @@ public final class DashboardApplication: @unchecked Sendable {
 
         var topology = TopologyDetector(
             sysctl: SystemSysctl.string,
-            integerSysctl: SystemSysctl.uint64
+            integerSysctl: SystemSysctl.uint64,
+            gpuCoreCount: GPUCoreCountReader.read
         ).detect()
         var controller = DashboardStateController(
             topology: topology,
@@ -120,6 +124,8 @@ public final class DashboardApplication: @unchecked Sendable {
         var timestampGate = SampleTimestampGate()
         var validCountAtLaunch = 0
         var lastValidRecordAt = ContinuousClock.now
+        var samplerLaunchedAt = ContinuousClock.now
+        var fastFailures = 0
         let stallTimeout = runtime.stallTimeoutOverride
             ?? PowerMetricsCommand.stallTimeout(intervalSeconds: options.intervalSeconds)
         let profilerTimeout = runtime.profilerTimeoutOverride ?? 5
@@ -226,8 +232,18 @@ public final class DashboardApplication: @unchecked Sendable {
             }
         }
 
+        func relaunchWorkingSampler() throws {
+            framer = NULRecordFramer()
+            stderrTail = ByteTail(capacity: 8 * 1_024)
+            sampler = try launchSampler(at: samplerIndex)
+            samplerLaunchedAt = .now
+            validCountAtLaunch = validRecordCount
+            lastValidRecordAt = .now
+        }
+
         try drawWaiting()
         sampler = try launchSampler(at: samplerIndex)
+        samplerLaunchedAt = .now
         validCountAtLaunch = validRecordCount
         lastValidRecordAt = .now
 
@@ -308,16 +324,27 @@ public final class DashboardApplication: @unchecked Sendable {
                         current.cleanup()
                     }
                     sampler = nil
-                    if validRecordCount == validCountAtLaunch,
-                       samplerIndex + 1 < runtime.samplerCommands.count {
+                    let producedThisLife = validRecordCount > validCountAtLaunch
+                    let age = durationSeconds(samplerLaunchedAt.duration(to: .now))
+                    // A life that already produced a sample is healthy, even when the
+                    // child then exits. Only an immediate exit with no new sample
+                    // counts toward the cap, so one bad reading cannot end the
+                    // session and a launch that fails instantly cannot spin.
+                    if validRecordCount == 0 && samplerIndex + 1 < runtime.samplerCommands.count {
                         samplerIndex += 1
-                        framer = NULRecordFramer()
-                        stderrTail = ByteTail(capacity: 8 * 1_024)
-                        sampler = try launchSampler(at: samplerIndex)
-                        validCountAtLaunch = validRecordCount
-                        lastValidRecordAt = .now
-                    } else {
+                        fastFailures = 0
+                        try relaunchWorkingSampler()
+                    } else if validRecordCount == 0 {
                         throw DashboardRuntimeError.collectorExited(lastDiagnostic(stderrTail.string))
+                    } else if !producedThisLife && age < runtime.fastFailureWindow {
+                        fastFailures += 1
+                        if fastFailures >= runtime.fastFailureLimit {
+                            throw DashboardRuntimeError.collectorExited(lastDiagnostic(stderrTail.string))
+                        }
+                        try relaunchWorkingSampler()
+                    } else {
+                        fastFailures = 0
+                        try relaunchWorkingSampler()
                     }
 
                 case let .processExit(pid) where pid == profilerAtWait?.pid:

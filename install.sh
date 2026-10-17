@@ -57,8 +57,17 @@ if ! command -v strip >/dev/null 2>&1; then
 fi
 
 echo "[1/3] Building optimized native executable..."
-swift build -c release --product silitop
-BIN_DIR="$(swift build -c release --show-bin-path)"
+BUILD_PATH="$(mktemp -d "${TMPDIR:-/tmp}/silitop-build.XXXXXX")"
+STAGED_PATH=""
+cleanup() {
+    if [[ -n "${STAGED_PATH}" ]]; then
+        sudo rm -f "${STAGED_PATH}"
+    fi
+    rm -rf "${BUILD_PATH}"
+}
+trap cleanup EXIT HUP INT TERM
+swift build -c release --product silitop --build-path "${BUILD_PATH}"
+BIN_DIR="$(swift build -c release --show-bin-path --build-path "${BUILD_PATH}")"
 BINARY="${BIN_DIR}/silitop"
 if [[ ! -x "${BINARY}" ]]; then
     echo "Error: release build did not produce ${BINARY}." >&2
@@ -70,15 +79,11 @@ echo "      Done."
 echo "[2/3] Installing atomically to ${INSTALL_DIR}..."
 sudo mkdir -p "${INSTALL_DIR}"
 STAGED_PATH="${INSTALL_DIR}/.silitop-install.$$"
-cleanup_stage() {
-    sudo rm -f "${STAGED_PATH}"
-}
-trap cleanup_stage EXIT HUP INT TERM
 sudo install -o root -g wheel -m 0755 "${BINARY}" "${STAGED_PATH}"
 sudo mv -f "${STAGED_PATH}" "${INSTALL_DIR}/silitop"
+STAGED_PATH=""
 # Remove helper binaries left by upgrades from the Python implementation.
 sudo rm -f "${INSTALL_DIR}/silitop-temps" "${INSTALL_DIR}/silitop-fans"
-trap - EXIT HUP INT TERM
 echo "      Done."
 
 echo "[3/3] Verifying installation..."

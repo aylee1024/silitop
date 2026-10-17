@@ -38,6 +38,7 @@ public struct PowerMetricsCommand: Equatable, Sendable {
             "-o", "-",
             "-i", String(safeInterval * 1_000),
             "--samplers", samplerSet.value,
+            "--handle-invalid-values",
         ]
     }
 
