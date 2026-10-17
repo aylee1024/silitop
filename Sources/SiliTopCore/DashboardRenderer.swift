@@ -117,6 +117,9 @@ public enum TemperatureBand: Equatable {
 }
 
 public struct DashboardRenderer {
+    // Display floor so a few watts of idle does not fill the row. Not a chip limit.
+    private static let powerSparkFloorWatts = 20.0
+
     private let ansi: Bool
     private let colorScheme: Int
 
@@ -257,44 +260,44 @@ public struct DashboardRenderer {
             row += 3
         }
 
-        if row + 3 < rows {
+        if row + 4 < rows {
             if let net = metricValue(snapshot.network) {
                 let title = "Net: ↓\(formatRate(net.inBytesPerSecond)) ↑\(formatRate(net.outBytesPerSecond))"
-                drawBox(screen, row, 0, 3, leftW, title)
+                drawBox(screen, row, 0, 4, leftW, title)
                 let sparkAvail = leftW - 4
                 if sparkAvail > 10 && histories.networkIn.count > 1 {
                     let hw = sparkAvail / 2
                     screen.write(row + 1, 2, "↓", foreground: 36)
-                    drawSpark(screen, row + 1, 3, min(hw - 1, histories.networkIn.count), histories.networkIn, sparkCeiling(histories.networkIn), 36)
+                    drawSpark(screen, row + 1, 3, hw - 1, histories.networkIn, 1, 36)
                     let mid = 2 + hw + 1
                     screen.write(row + 1, mid, "↑", foreground: 31)
-                    drawSpark(screen, row + 1, mid + 1, min(hw - 1, histories.networkOut.count), histories.networkOut, sparkCeiling(histories.networkOut), 31)
+                    drawSpark(screen, row + 1, mid + 1, hw - 1, histories.networkOut, 1, 31)
                 }
             } else {
-                drawUnavailable(screen, row, 0, 3, leftW, "Net")
+                drawUnavailable(screen, row, 0, 4, leftW, "Net")
             }
             if let disk = metricValue(snapshot.disk) {
                 let title = "Disk: R \(formatRate(disk.readBytesPerSecond)) W \(formatRate(disk.writeBytesPerSecond))"
-                drawBox(screen, row, half, 3, rightW, title)
+                drawBox(screen, row, half, 4, rightW, title)
                 let sparkAvail = rightW - 4
                 if sparkAvail > 10 && histories.diskRead.count > 1 {
                     let hw = sparkAvail / 2
                     screen.write(row + 1, half + 2, "R", foreground: 36)
-                    drawSpark(screen, row + 1, half + 3, min(hw - 1, histories.diskRead.count), histories.diskRead, sparkCeiling(histories.diskRead), 36)
+                    drawSpark(screen, row + 1, half + 3, hw - 1, histories.diskRead, 1, 36)
                     let mid = half + 2 + hw + 1
                     screen.write(row + 1, mid, "W", foreground: 31)
-                    drawSpark(screen, row + 1, mid + 1, min(hw - 1, histories.diskWrite.count), histories.diskWrite, sparkCeiling(histories.diskWrite), 31)
+                    drawSpark(screen, row + 1, mid + 1, hw - 1, histories.diskWrite, 1, 31)
                 }
             } else {
-                drawUnavailable(screen, row, half, 3, rightW, "Disk")
+                drawUnavailable(screen, row, half, 4, rightW, "Disk")
             }
-            last = max(last, row + 2)
-            row += 3
+            last = max(last, row + 3)
+            row += 4
         }
 
-        if row + 7 < rows {
+        if row + 9 < rows {
             if let memory = metricValue(snapshot.memory) {
-                drawBox(screen, row, 0, 7, leftW, "Memory")
+                drawBox(screen, row, 0, 9, leftW, "Memory")
                 let ram = "RAM: \(oneDecimal(memory.usedGiB))/\(oneDecimal(memory.totalGiB)) GB (\(memory.percentUsed)%)"
                 screen.write(row + 1, 2, ram, foreground: 37, clipRight: leftW - 1)
                 drawHBar(screen, row + 2, 2, leftW - 4, memory.percentUsed, "", 32)
@@ -315,11 +318,11 @@ public struct DashboardRenderer {
                     screen.write(row + 4, 2, String(breakdown.prefix(avail)), foreground: 37, dim: true, clipRight: 2 + avail)
                 }
             } else {
-                drawUnavailable(screen, row, 0, 7, leftW, "Memory")
+                drawUnavailable(screen, row, 0, 9, leftW, "Memory")
             }
 
             if let power = metricValue(snapshot.power) {
-                drawBox(screen, row, half, 7, rightW, "Power")
+                drawBox(screen, row, half, 9, rightW, "Power")
                 let clip = half + rightW - 1
                 let origin = half + 2
                 screen.write(row + 1, origin, "CPU: \(watts(power.cpuWatts))W  GPU: \(watts(power.gpuWatts))W  ANE: \(watts(power.aneWatts))W  Total: \(watts(power.packageWatts))W", foreground: 37, clipRight: clip)
@@ -331,15 +334,15 @@ public struct DashboardRenderer {
                 let sparkW = rightW - 8
                 if sparkW > 10 && histories.cpuPower.count > 1 {
                     screen.write(row + 4, origin, "CPU ", foreground: 37)
-                    drawSpark(screen, row + 4, half + 6, min(sparkW, histories.cpuPower.count), histories.cpuPower, topology.powerLimits.cpuWatts, accentColor)
-                    screen.write(row + 5, origin, "GPU ", foreground: 37)
-                    drawSpark(screen, row + 5, half + 6, min(sparkW, histories.gpuPower.count), histories.gpuPower, topology.powerLimits.gpuWatts, 33)
+                    drawSpark(screen, row + 4, half + 6, sparkW, histories.cpuPower, Self.powerSparkFloorWatts, accentColor)
+                    screen.write(row + 6, origin, "GPU ", foreground: 37)
+                    drawSpark(screen, row + 6, half + 6, sparkW, histories.gpuPower, Self.powerSparkFloorWatts, 33)
                 }
             } else {
-                drawUnavailable(screen, row, half, 7, rightW, "Power")
+                drawUnavailable(screen, row, half, 9, rightW, "Power")
             }
-            last = max(last, row + 6)
-            row += 7
+            last = max(last, row + 8)
+            row += 9
         }
 
         let hasTemps = !cpuDie.isEmpty || !gpuDie.isEmpty || !other.isEmpty
@@ -507,17 +510,30 @@ public struct DashboardRenderer {
         _ x: Int,
         _ width: Int,
         _ values: [Double],
-        _ maximum: Double,
+        _ floor: Double,
         _ foreground: Int
     ) {
-        guard width >= 3, !values.isEmpty else { return }
+        guard width >= 3, !values.isEmpty, y + 1 < screen.rows else { return }
         let glyphs = Array("▁▂▃▄▅▆▇█")
-        let scale = maximum.isFinite ? max(maximum, 0.01) : 0.01
-        for (offset, raw) in values.suffix(width).enumerated() {
+        let drawn = values.suffix(width)
+        let visibleMax = drawn.lazy.filter(\.isFinite).max() ?? 0
+        let floorValue = floor.isFinite ? floor : 0
+        let scale = max(visibleMax, floorValue, 0.01)
+        for (offset, raw) in drawn.enumerated() {
             let sample = raw.isFinite ? raw : 0
             let ratio = min(max(sample / scale, 0), 1)
-            let index = min(glyphs.count - 1, Int(ratio * Double(glyphs.count - 1)))
-            screen.write(y, x + offset, String(glyphs[index]), foreground: foreground)
+            let index = min(15, Int(ratio * 15))
+            let top: Character
+            let bottom: Character
+            if index < 8 {
+                top = " "
+                bottom = glyphs[index]
+            } else {
+                top = glyphs[index - 8]
+                bottom = glyphs[7]
+            }
+            screen.write(y, x + offset, String(top), foreground: foreground)
+            screen.write(y + 1, x + offset, String(bottom), foreground: foreground)
         }
     }
 
@@ -635,10 +651,6 @@ public struct DashboardRenderer {
         if value >= 1_048_576 { return String(format: "%.1f MB/s", value / 1_048_576) }
         if value >= 1_024 { return String(format: "%.0f KB/s", value / 1_024) }
         return String(format: "%.0f B/s", value)
-    }
-
-    private func sparkCeiling(_ values: [Double]) -> Double {
-        max(values.filter(\.isFinite).max() ?? 1, 1)
     }
 }
 
