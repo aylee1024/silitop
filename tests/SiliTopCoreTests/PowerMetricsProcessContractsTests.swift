@@ -10,7 +10,7 @@ final class PowerMetricsProcessContractsTests: XCTestCase {
         XCTAssertEqual(command.executable, "/usr/bin/nice")
         XCTAssertEqual(command.arguments, [
             "-n", "10", "/usr/bin/powermetrics",
-            "-b", "0", "-f", "plist", "-o", "-", "-i", "5000",
+            "-b", "0", "-f", "plist", "-i", "5000",
             "--samplers", "cpu_power,gpu_power,thermal,network,disk",
             "--handle-invalid-values",
         ])
