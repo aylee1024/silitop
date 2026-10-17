@@ -45,9 +45,10 @@ final class DashboardRendererTests: XCTestCase {
             size: TerminalSize(rows: 60, columns: 100)
         ), as: UTF8.self)
 
-        XCTAssertTrue(text.contains("\u{1B}[36mz0:49\u{1B}[32m"))
-        XCTAssertTrue(text.contains("\u{1B}[33mz1:70\u{1B}[32m"))
-        XCTAssertTrue(text.contains("\u{1B}[31mz2:71\u{1B}[32m"))
+        XCTAssertTrue(text.contains("\u{1B}[0;36mz0:49"))
+        XCTAssertTrue(text.contains("\u{1B}[0;33mz1:70"))
+        XCTAssertTrue(text.contains("\u{1B}[0;31mz2:71"))
+        XCTAssertTrue(text.contains("\u{1B}[0;1;32m█"))
         for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
             XCTAssertLessThanOrEqual(DisplayWidth.measure(String(line)), 100)
         }
@@ -60,7 +61,7 @@ final class DashboardRendererTests: XCTestCase {
             size: TerminalSize(rows: 60, columns: 100)
         ), as: UTF8.self)
 
-        XCTAssertTrue(text.hasPrefix("\u{1B}[H\u{1B}[36m"))
+        XCTAssertTrue(text.hasPrefix("\u{1B}[H\u{1B}[0;1;7;36m"))
         XCTAssertTrue(text.contains("\u{1B}[J"))
         XCTAssertTrue(text.hasSuffix("\u{1B}[0m"))
     }
@@ -83,32 +84,57 @@ final class DashboardRendererTests: XCTestCase {
         XCTAssertFalse(text.contains("P6 "))
     }
 
-    func testFullDashboardContainsEveryExistingPanelAndFitsWidth() {
+    func testFullDashboardMatchesTheBoxedCursesLayout() {
         let rendered = DashboardRenderer(ansi: false).render(
             snapshot: completeSnapshot(),
             histories: DashboardHistories.example,
             size: TerminalSize(rows: 60, columns: 100)
         )
         let text = String(decoding: rendered, as: UTF8.self)
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
 
-        for heading in ["silitop", "Super", "Performance", "GPU", "ANE", "Fans", "Power", "Network", "Disk I/O", "Memory", "Temperatures", "Thermal Pressure", "q: quit"] {
-            XCTAssertTrue(text.contains(heading), "Missing heading \(heading) in:\n\(text)")
-        }
-        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            XCTAssertLessThanOrEqual(DisplayWidth.measure(String(line)), 100)
+        XCTAssertTrue(lines[0].contains("silitop - Apple M5 Pro (6S+12P+20GPU)"))
+        XCTAssertTrue(lines.contains { $0.contains("Super:") && $0.contains("Performance:") && $0.contains("83°C") })
+        XCTAssertTrue(lines.contains { $0.contains("Fans") && $0.contains("P8") })
+        XCTAssertTrue(text.contains("GPU: 75% @ 1000 MHz  72°C"))
+        XCTAssertTrue(text.contains("ANE: 1% @ 0.1W"))
+        XCTAssertTrue(text.contains("Net: ↓1 KB/s ↑2 KB/s"))
+        XCTAssertTrue(text.contains("Disk: R 4 KB/s W 8 KB/s"))
+        XCTAssertTrue(text.contains("RAM: 32.0/64.0 GB (50%)"))
+        XCTAssertTrue(text.contains("Swap: 0.5/2.0 GB"))
+        XCTAssertTrue(text.contains("CPU: 5.0W  GPU: 2.0W  ANE: 0.1W  Total: 10.0W"))
+        XCTAssertTrue(text.contains("Throttle:"))
+        XCTAssertTrue(text.contains("no"))
+        XCTAssertTrue(text.contains("2520r"))
+        XCTAssertTrue(text.contains("off"))
+        XCTAssertTrue(text.contains("Temperatures"))
+        XCTAssertTrue(text.contains("Thermal Pressure:"))
+        XCTAssertTrue(text.contains("Nominal"))
+        XCTAssertTrue(text.contains("q: quit | silitop"))
+        XCTAssertTrue(text.contains("┌"))
+        XCTAssertTrue(text.contains("█"))
+        XCTAssertFalse(text.contains("Disk I/O"))
+        XCTAssertFalse(text.contains("Ctrl-C"))
+        XCTAssertFalse(text.contains("—"))
+        for line in lines {
+            XCTAssertLessThanOrEqual(DisplayWidth.measure(line), 100)
         }
     }
 
-    func testStandardTwentyFourRowTerminalKeepsEveryPanelVisible() {
+    func testTwentyFourRowTerminalDropsPanelsThatDoNotFit() {
         let text = String(decoding: DashboardRenderer(ansi: false).render(
             snapshot: completeSnapshot(),
             histories: DashboardHistories.example,
             size: TerminalSize(rows: 24, columns: 100)
         ), as: UTF8.self)
 
-        for heading in ["CPU", "GPU", "ANE", "Fans", "Power", "Network", "Disk I/O", "Memory", "Temperatures", "Thermal Pressure", "q: quit"] {
-            XCTAssertTrue(text.contains(heading), "Missing \(heading) in compact frame:\n\(text)")
-        }
+        XCTAssertTrue(text.contains("Super:"))
+        XCTAssertTrue(text.contains("Fans"))
+        XCTAssertTrue(text.contains("ANE:"))
+        XCTAssertTrue(text.contains("q: quit | silitop"))
+        XCTAssertFalse(text.contains("Disk:"))
+        XCTAssertFalse(text.contains("Memory"))
+        XCTAssertFalse(text.contains("Temperatures"))
         XCTAssertLessThanOrEqual(text.split(separator: "\n").count, 24)
     }
 
@@ -149,8 +175,20 @@ final class DashboardRendererTests: XCTestCase {
             size: TerminalSize(rows: 60, columns: 100)
         ), as: UTF8.self)
 
-        XCTAssertTrue(text.contains("Memory: unavailable"))
-        XCTAssertTrue(text.contains("stale 10s"))
+        XCTAssertTrue(text.contains("Memory"))
+        XCTAssertTrue(text.contains("data unavailable"))
+        XCTAssertTrue(text.contains("z0:55"))
+        XCTAssertFalse(text.contains("stale"))
+    }
+
+    func testWaitingScreenUsesTheOldCopy() {
+        let text = String(decoding: DashboardRenderer(ansi: false).waiting(
+            size: TerminalSize(rows: 24, columns: 80)
+        ), as: UTF8.self)
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        XCTAssertEqual(lines[12].trimmingCharacters(in: .whitespaces), "Waiting for powermetrics data...")
+        XCTAssertEqual(lines[13].trimmingCharacters(in: .whitespaces), "(requires sudo)")
+        XCTAssertFalse(text.contains("—"))
     }
 
     func testSmallTerminalRendersOnlySizeWarning() {
@@ -161,7 +199,8 @@ final class DashboardRendererTests: XCTestCase {
         ), as: UTF8.self)
 
         XCTAssertTrue(text.contains("Terminal too small"))
-        XCTAssertFalse(text.contains("Disk I/O"))
+        XCTAssertFalse(text.contains("Disk:"))
+        XCTAssertFalse(text.contains("—"))
     }
 
     func testMissingSwapRendersUnavailableWithoutVoidingMemoryPanel() {
@@ -178,8 +217,8 @@ final class DashboardRendererTests: XCTestCase {
             size: TerminalSize(rows: 60, columns: 160)
         ), as: UTF8.self)
 
-        XCTAssertTrue(text.contains("Memory  32.0/64.0 GB"))
-        XCTAssertTrue(text.contains("Swap unavailable"))
+        XCTAssertTrue(text.contains("RAM: 32.0/64.0 GB (50%)"))
+        XCTAssertTrue(text.contains("Swap: inactive"))
     }
 
     func testHugeFinitePowerDoesNotTrapRendererIntegerConversions() {
@@ -196,8 +235,8 @@ final class DashboardRendererTests: XCTestCase {
             size: TerminalSize(rows: 60, columns: 120)
         ), as: UTF8.self)
 
-        XCTAssertTrue(text.contains("ANE"))
         XCTAssertTrue(text.contains("100%"))
+        XCTAssertTrue(text.contains("GPU:"))
     }
 
     private func completeSnapshot() -> DashboardSnapshot {
@@ -207,13 +246,13 @@ final class DashboardRendererTests: XCTestCase {
             slowLabel: "Performance",
             fastPrefix: "S",
             slowPrefix: "P",
-            fastCoreCount: 1,
-            slowCoreCount: 1,
+            fastCoreCount: 6,
+            slowCoreCount: 12,
             gpuCoreCount: 20
         )
         let cpu = CPUReading(
-            fastCores: [CoreReading(id: 0, activePercent: 50, frequencyMHz: 4_000)],
-            slowCores: [CoreReading(id: 1, activePercent: 25, frequencyMHz: 3_000)],
+            fastCores: (0..<6).map { CoreReading(id: $0, activePercent: 50, frequencyMHz: 4_000) },
+            slowCores: (0..<12).map { CoreReading(id: $0 + 6, activePercent: 25, frequencyMHz: 3_000) },
             fastActivePercent: 50,
             slowActivePercent: 25,
             fastFrequencyMHz: 4_000,
@@ -229,13 +268,20 @@ final class DashboardRendererTests: XCTestCase {
             network: .fresh(NetworkReading(inBytesPerSecond: 1_024, outBytesPerSecond: 2_048), observedAt: observed),
             disk: .fresh(DiskReading(readBytesPerSecond: 4_096, writeBytesPerSecond: 8_192), observedAt: observed),
             memory: .fresh(MemoryReading(totalGiB: 64, usedGiB: 32, freeGiB: 32, percentUsed: 50, wiredGiB: 5, compressedGiB: 4, appGiB: 23, cachedGiB: 8, swapTotalGiB: 2, swapUsedGiB: 0.5), observedAt: observed),
-            temperatures: .fresh([
-                TemperatureReading(name: "PMU tdie0", celsius: 55),
-                TemperatureReading(name: "PMU tdie1", celsius: 60),
-                TemperatureReading(name: "PMU tdie2", celsius: 65),
-                TemperatureReading(name: "NAND CH0 temp", celsius: 41),
-            ], observedAt: observed),
-            fans: .fresh(.fans([FanReading(index: 0, rpm: 2_000, maximumRPM: 6_500)]), observedAt: observed),
+            temperatures: .fresh(
+                (0..<10).map { TemperatureReading(name: "PMU tdie\($0)", celsius: $0 == 0 ? 83 : 74) }
+                    + [
+                        TemperatureReading(name: "PMU tdie10", celsius: 72),
+                        TemperatureReading(name: "PMU tdie11", celsius: 72),
+                        TemperatureReading(name: "NAND CH0 temp", celsius: 33),
+                        TemperatureReading(name: "gas gauge battery", celsius: 30),
+                    ],
+                observedAt: observed
+            ),
+            fans: .fresh(.fans([
+                FanReading(index: 0, rpm: 2_520, maximumRPM: 6_500),
+                FanReading(index: 1, rpm: 0, maximumRPM: 6_500),
+            ]), observedAt: observed),
             thermalPressure: .fresh("Nominal", observedAt: observed)
         )
     }

@@ -10,7 +10,7 @@ silitop shows per-core CPU activity, GPU and ANE use, fans, power, network and d
 
 silitop is now one dependency-free Swift executable. The dashboard no longer needs Python, curses, recurring temperature/fan helper processes, or temporary plist files. After startup, its only recurring child is Apple's `powermetrics`.
 
-The native event loop reads `powermetrics` records directly from a bounded pipe, samples memory and sensors in-process, and draws each frame with one terminal write. Collection failures are never displayed as zero: an affected panel says `unavailable`, or retains its last good value with a visible `stale Ns` age. If only the swap query fails, the rest of the memory panel stays live and its swap field says `unavailable`.
+The native event loop reads `powermetrics` records directly from a bounded pipe, samples memory and sensors in-process, and draws each frame with one terminal write. The screen is the boxed dashboard: reverse title, fast cores on the left, slow cores on the right, fans under the fast cores, then GPU, ANE, network, disk, memory, power, and temperatures. A panel with no reading says `data unavailable`. A later failure keeps the last reading. If swap is inactive, the memory panel stays and says `Swap: inactive`.
 
 ## Features
 
@@ -23,7 +23,7 @@ The native event loop reads `powermetrics` records directly from a bounded pipe,
 - Network and disk throughput with history
 - Activity Monitor-style memory math plus native swap readings
 - Classified CPU/GPU die zones, SSD and battery temperatures
-- Thermal pressure and visible stale/unavailable states
+- Thermal pressure, and a data-unavailable panel when a reading is missing
 - Responsive resize, signal-safe cleanup, and concurrent-instance support
 - No third-party packages or configuration files
 

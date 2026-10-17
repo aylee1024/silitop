@@ -135,19 +135,7 @@ public final class DashboardApplication: @unchecked Sendable {
         }
 
         func drawWaiting() throws {
-            let size = terminalSize()
-            let chip = topology.name.map { " — \($0)" } ?? ""
-            let width = max(1, size.columns)
-            var lines: [String]
-            if size.rows < 10 || size.columns < 40 {
-                lines = ["Terminal too small — resize to at least 40×10"]
-            } else {
-                lines = ["silitop\(chip)", "", "Waiting for powermetrics…", "", "q: quit"]
-            }
-            let body = lines.prefix(max(1, size.rows))
-                .map { DisplayWidth.fit($0, to: width) }
-                .joined(separator: "\n") + "\n"
-            try terminal.write(Data(("\u{1B}[H" + body + "\u{1B}[J").utf8))
+            try terminal.write(renderer.waiting(size: terminalSize()))
         }
 
         func redraw() throws {
