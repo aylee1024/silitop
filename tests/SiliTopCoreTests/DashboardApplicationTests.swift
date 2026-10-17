@@ -33,7 +33,7 @@ final class DashboardApplicationTests: XCTestCase {
             do { try application.run() } catch { result.error = error }
             finished.fulfill()
         }
-        var captured = waitForOutput(pty.master, containing: "Disk I/O", timeout: 3)
+        var captured = waitForOutput(pty.master, containing: "Disk:", timeout: 3)
         var quit = UInt8(ascii: "q")
         XCTAssertEqual(Darwin.write(pty.master, &quit, 1), 1)
         wait(for: [finished], timeout: 2)
@@ -43,7 +43,7 @@ final class DashboardApplicationTests: XCTestCase {
         captured.append(readAll(pty.master))
         let output = String(decoding: captured, as: UTF8.self)
         XCTAssertTrue(output.contains("Waiting for powermetrics"))
-        XCTAssertTrue(output.contains("Disk I/O"), "Captured PTY output:\n\(output)")
+        XCTAssertTrue(output.contains("Disk:"), "Captured PTY output:\n\(output)")
         XCTAssertTrue(output.contains("\u{1B}[?1049l"))
         var restored = termios()
         XCTAssertEqual(tcgetattr(pty.slave, &restored), 0)
@@ -126,7 +126,7 @@ final class DashboardApplicationTests: XCTestCase {
             do { try application.run() } catch { result.error = error }
             finished.fulfill()
         }
-        _ = waitForOutput(pty.master, containing: "Disk I/O", timeout: 3)
+        _ = waitForOutput(pty.master, containing: "Disk:", timeout: 3)
         var quit = UInt8(ascii: "q")
         let started = ContinuousClock.now
         XCTAssertEqual(Darwin.write(pty.master, &quit, 1), 1)
@@ -178,7 +178,7 @@ final class DashboardApplicationTests: XCTestCase {
             finished.fulfill()
         }
 
-        _ = waitForOutput(pty.master, containing: "Disk I/O", timeout: 3)
+        _ = waitForOutput(pty.master, containing: "Disk:", timeout: 3)
         let restartDeadline = Date().addingTimeInterval(3)
         var launches = ""
         while Date() < restartDeadline {
@@ -266,10 +266,10 @@ final class DashboardApplicationTests: XCTestCase {
             do { try second.run() } catch { secondResult.error = error }
             secondFinished.fulfill()
         }
-        let firstOutput = waitForOutput(firstPTY.master, containing: "Disk I/O", timeout: 3)
-        let secondOutput = waitForOutput(secondPTY.master, containing: "Disk I/O", timeout: 3)
-        XCTAssertTrue(String(decoding: firstOutput, as: UTF8.self).contains("Disk I/O"))
-        XCTAssertTrue(String(decoding: secondOutput, as: UTF8.self).contains("Disk I/O"))
+        let firstOutput = waitForOutput(firstPTY.master, containing: "Disk:", timeout: 3)
+        let secondOutput = waitForOutput(secondPTY.master, containing: "Disk:", timeout: 3)
+        XCTAssertTrue(String(decoding: firstOutput, as: UTF8.self).contains("Disk:"))
+        XCTAssertTrue(String(decoding: secondOutput, as: UTF8.self).contains("Disk:"))
         var quit = UInt8(ascii: "q")
         XCTAssertEqual(Darwin.write(firstPTY.master, &quit, 1), 1)
         XCTAssertEqual(Darwin.write(secondPTY.master, &quit, 1), 1)
@@ -309,7 +309,7 @@ final class DashboardApplicationTests: XCTestCase {
             do { try application.run() } catch { result.error = error }
             finished.fulfill()
         }
-        _ = waitForOutput(pty.master, containing: "Disk I/O", timeout: 3)
+        _ = waitForOutput(pty.master, containing: "Disk:", timeout: 3)
         let pidDeadline = Date().addingTimeInterval(1)
         while Date() < pidDeadline, !FileManager.default.fileExists(atPath: pidFile.path) {
             usleep(1_000)
@@ -350,7 +350,7 @@ final class DashboardApplicationTests: XCTestCase {
             do { try application.run() } catch { result.error = error }
             finished.fulfill()
         }
-        _ = waitForOutput(pty.master, containing: "Disk I/O", timeout: 3)
+        _ = waitForOutput(pty.master, containing: "Disk:", timeout: 3)
         XCTAssertEqual(Darwin.kill(getpid(), SIGTERM), 0)
         wait(for: [finished], timeout: 1)
 
@@ -381,7 +381,7 @@ final class DashboardApplicationTests: XCTestCase {
             do { try application.run() } catch { result.error = error }
             finished.fulfill()
         }
-        _ = waitForOutput(pty.master, containing: "Disk I/O", timeout: 3)
+        _ = waitForOutput(pty.master, containing: "Disk:", timeout: 3)
         XCTAssertEqual(Darwin.kill(getpid(), SIGQUIT), 0)
         wait(for: [finished], timeout: 1)
 
@@ -411,7 +411,7 @@ final class DashboardApplicationTests: XCTestCase {
             do { try application.run() } catch { result.error = error }
             finished.fulfill()
         }
-        _ = waitForOutput(pty.master, containing: "Disk I/O", timeout: 3)
+        _ = waitForOutput(pty.master, containing: "Disk:", timeout: 3)
         _ = readAll(pty.master)
         var small = winsize(ws_row: 9, ws_col: 39, ws_xpixel: 0, ws_ypixel: 0)
         XCTAssertEqual(ioctl(pty.slave, TIOCSWINSZ, &small), 0)

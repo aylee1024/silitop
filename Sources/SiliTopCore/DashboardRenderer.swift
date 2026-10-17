@@ -130,319 +130,609 @@ public struct DashboardRenderer {
         histories: DashboardHistories,
         size: TerminalSize
     ) -> Data {
-        let width = max(1, size.columns)
+        let columns = max(1, size.columns)
+        let rows = max(1, size.rows)
+        let screen = LegacyScreen(rows: rows, columns: columns)
         if size.rows < 10 || size.columns < 40 {
-            let warning = DisplayWidth.fit("Terminal too small — resize to at least 40×10", to: width)
-            return Data((ansiPrefix + warning + "\n" + ansiSuffix).utf8)
+            screen.write(0, 0, "Terminal too small", foreground: 31)
+            return screen.encode(through: 0, ansi: ansi)
         }
+        let lastRow = paint(snapshot, histories: histories, on: screen)
+        return screen.encode(through: lastRow, ansi: ansi)
+    }
 
-        func frameLines(compact: Bool) -> [String] {
-            let chip = snapshot.topology.name.map { " — \($0)" } ?? ""
-            let sections = [
-                "silitop\(chip)",
-                cpuSection(snapshot.cpu, topology: snapshot.topology, width: width, includeCoreRows: !compact),
-                gpuSection(snapshot.gpu, topology: snapshot.topology, width: width),
-                aneSection(snapshot.power, topology: snapshot.topology, width: width, now: snapshot.observedAt),
-                fanSection(snapshot.fans, now: snapshot.observedAt),
-                powerSection(snapshot.power, topology: snapshot.topology, histories: histories, now: snapshot.observedAt),
-                networkSection(snapshot.network, histories: histories, now: snapshot.observedAt),
-                diskSection(snapshot.disk, histories: histories, now: snapshot.observedAt),
-                memorySection(snapshot.memory, now: snapshot.observedAt),
-                temperatureSection(snapshot.temperatures, now: snapshot.observedAt, compact: compact),
-                thermalSection(snapshot.thermalPressure, now: snapshot.observedAt),
-                "q: quit  •  Ctrl-C: quit",
-            ]
-            return sections.flatMap {
-                $0.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-            }
+    func waiting(size: TerminalSize) -> Data {
+        let columns = max(1, size.columns)
+        let rows = max(1, size.rows)
+        let screen = LegacyScreen(rows: rows, columns: columns)
+        if size.rows < 10 || size.columns < 40 {
+            screen.write(0, 0, "Terminal too small", foreground: 31)
+            return screen.encode(through: 0, ansi: ansi)
         }
-
-        let fullLines = frameLines(compact: false)
-        let selected = fullLines.count <= size.rows ? fullLines : frameLines(compact: true)
-        let visible = selected.prefix(max(1, size.rows))
-        let body = visible.map { DisplayWidth.fit($0, to: width) }.joined(separator: "\n") + "\n"
-        return Data((ansiPrefix + body + ansiSuffix).utf8)
+        let message = "Waiting for powermetrics data..."
+        let note = "(requires sudo)"
+        let y = rows / 2
+        screen.write(y, max(0, (columns - message.count) / 2), message, foreground: 33)
+        let noteRow = min(rows - 1, y + 1)
+        screen.write(noteRow, max(0, (columns - note.count) / 2), note, foreground: 37)
+        return screen.encode(through: noteRow, ansi: ansi)
     }
 
-    private var ansiPrefix: String {
-        guard ansi else { return "" }
-        let codes = [37, 31, 32, 33, 34, 35, 36]
-        return "\u{1B}[H\u{1B}[\(codes[colorScheme])m"
-    }
-
-    private var ansiSuffix: String {
-        ansi ? "\u{1B}[J\u{1B}[0m" : ""
-    }
-
-    private var mainColorCode: String {
-        guard ansi else { return "" }
-        let codes = [37, 31, 32, 33, 34, 35, 36]
-        return "\u{1B}[\(codes[colorScheme])m"
-    }
-
-    private func cpuSection(
-        _ state: MetricState<CPUReading>,
-        topology: Topology,
-        width: Int,
-        includeCoreRows: Bool
-    ) -> String {
-        switch state {
-        case .unavailable:
-            return "CPU: unavailable\n\(topology.fastLabel): unavailable\n\(topology.slowLabel): unavailable"
-        case let .fresh(reading, _), let .stale(reading, _, _):
-            var lines = ["CPU"]
-            lines.append("\(topology.fastLabel)  \(reading.fastActivePercent)% @ \(formatFrequency(reading.fastFrequencyMHz))")
-            if includeCoreRows {
-                for (index, core) in reading.fastCores.enumerated() {
-                    let suffix = String(format: " %3d%% %@", core.activePercent, formatFrequency(core.frequencyMHz))
-                    lines.append(HorizontalBar.render(width: width, percent: core.activePercent, label: "\(topology.fastPrefix)\(index + 1) ", suffix: suffix))
-                }
-            }
-            lines.append("\(topology.slowLabel)  \(reading.slowActivePercent)% @ \(formatFrequency(reading.slowFrequencyMHz))")
-            if includeCoreRows {
-                for (index, core) in reading.slowCores.enumerated() {
-                    let suffix = String(format: " %3d%% %@", core.activePercent, formatFrequency(core.frequencyMHz))
-                    lines.append(HorizontalBar.render(width: width, percent: core.activePercent, label: "\(topology.slowPrefix)\(index + 1) ", suffix: suffix))
-                }
-            }
-            return lines.joined(separator: "\n")
-        }
-    }
-
-    private func gpuSection(_ state: MetricState<GPUReading>, topology: Topology, width: Int) -> String {
-        switch state {
-        case .unavailable:
-            return "GPU: unavailable"
-        case let .fresh(reading, _), let .stale(reading, _, _):
-            let cores = topology.gpuCoreCount.map { " (\($0) cores)" } ?? ""
-            let suffix = String(format: " %3d%% %@", reading.activePercent, formatFrequency(reading.frequencyMHz))
-            return "GPU\(cores)\n" + HorizontalBar.render(width: width, percent: reading.activePercent, label: "GPU ", suffix: suffix)
-        }
-    }
-
-    private func aneSection(
-        _ state: MetricState<PowerReading>,
-        topology: Topology,
-        width: Int,
-        now: Date
-    ) -> String {
-        switch state {
-        case let .unavailable(reason):
-            return "ANE: unavailable (\(reason))"
-        case let .fresh(value, _):
-            return aneText(value, topology: topology, width: width)
-        case let .stale(value, observedAt, _):
-            return aneText(value, topology: topology, width: width)
-                + " — \(staleText(now: now, observedAt: observedAt))"
-        }
-    }
-
-    private func aneText(_ value: PowerReading, topology: Topology, width: Int) -> String {
-        let limit = max(0.001, topology.powerLimits.aneWatts)
-        let rawPercent = value.aneWatts / limit * 100
-        let boundedPercent = rawPercent.isFinite ? min(100, max(0, rawPercent)) : 0
-        let percent = Int(boundedPercent.rounded())
-        let suffix = String(format: " %3d%% %.1fW", percent, value.aneWatts)
-        return "ANE\n" + HorizontalBar.render(width: width, percent: percent, label: "ANE ", suffix: suffix)
-    }
-
-    private func fanSection(_ state: MetricState<FanCollection>, now: Date) -> String {
-        switch state {
-        case let .unavailable(reason):
-            return "Fans: unavailable (\(reason))"
-        case let .fresh(collection, _):
-            return fanText(collection)
-        case let .stale(collection, observedAt, _):
-            return fanText(collection) + " — \(staleText(now: now, observedAt: observedAt))"
-        }
-    }
-
-    private func fanText(_ collection: FanCollection) -> String {
-        switch collection {
-        case .fanless:
-            return "Fans: fanless"
-        case let .fans(fans):
-            let readings = fans.map { fan in
-                String(format: "F%d %.0f/%.0f RPM", fan.index, fan.rpm, fan.maximumRPM)
-            }
-            return "Fans: " + readings.joined(separator: "  ")
-        }
-    }
-
-    private func powerSection(
-        _ state: MetricState<PowerReading>,
-        topology: Topology,
+    // Fast cores on the left, slow cores on the right. Fans use only the
+    // leftover rows under the fast box. A panel whose height does not fit
+    // is skipped, same as the curses screen.
+    private func paint(
+        _ snapshot: DashboardSnapshot,
         histories: DashboardHistories,
-        now: Date
-    ) -> String {
-        switch state {
-        case let .unavailable(reason):
-            return "Power: unavailable (\(reason))"
-        case let .fresh(value, _):
-            return powerText(value, topology: topology, histories: histories)
-        case let .stale(value, observedAt, _):
-            return powerText(value, topology: topology, histories: histories) + " — \(staleText(now: now, observedAt: observedAt))"
+        on screen: LegacyScreen
+    ) -> Int {
+        let columns = screen.columns
+        let rows = screen.rows
+        let half = columns / 2
+        let leftW = half - 1
+        let rightW = columns - half - 1
+        let topology = snapshot.topology
+        let header = "\(topology.name ?? "Apple Silicon") (\(countText(topology.fastCoreCount))\(topology.fastPrefix)+\(countText(topology.slowCoreCount))\(topology.slowPrefix)+\(countText(topology.gpuCoreCount))GPU)"
+        screen.write(0, 0, centered(" silitop - \(header) ", columns), foreground: accentColor, bold: true, reverse: true)
+
+        let classified = metricValue(snapshot.temperatures).map { TemperatureClassifier.classify($0) }
+        let cpuDie = classified?.cpuDie ?? []
+        let gpuDie = classified?.gpuDie ?? []
+        let other = classified?.other ?? [:]
+        let cpuDieMax = finiteMax(cpuDie.map(\.celsius))
+        let gpuDieMax = finiteMax(gpuDie.map(\.celsius))
+        let fans = fanList(snapshot.fans)
+        let thermal = thermalText(snapshot.thermalPressure)
+        var row = 1
+        var last = 0
+
+        if let cpu = metricValue(snapshot.cpu) {
+            let fastBoxH = cpu.fastCores.count + 2
+            let slowBoxH = cpu.slowCores.count + 2
+            let cpuBoxH = max(fastBoxH, slowBoxH)
+            if row + cpuBoxH < rows {
+                var slowTitle = "\(topology.slowLabel): \(cpu.slowActivePercent)% @ \(cpu.slowFrequencyMHz) MHz"
+                if let cpuDieMax {
+                    slowTitle += "  \(degrees(cpuDieMax))°C"
+                }
+                let fastTitle = "\(topology.fastLabel): \(cpu.fastActivePercent)% @ \(cpu.fastFrequencyMHz) MHz"
+                let blank = cpuBoxH - fastBoxH
+                if !fans.isEmpty && blank >= 3 {
+                    drawBox(screen, row, 0, fastBoxH, leftW, fastTitle)
+                    drawBox(screen, row + fastBoxH, 0, blank, leftW, "Fans")
+                    for (index, fan) in fans.enumerated() {
+                        if index >= blank - 2 { break }
+                        let fanY = row + fastBoxH + 1 + index
+                        let label = fixedLabel("F", index + 1)
+                        if fan.rpm == 0 {
+                            screen.write(fanY, 2, label + "  off", foreground: 37, dim: true, clipRight: leftW - 1)
+                        } else {
+                            let pct = fan.maximumRPM > 0 ? safeInt(fan.rpm / fan.maximumRPM * 100) : 0
+                            drawFanRow(screen, fanY, 2, leftW - 4, label, pct, fan.rpm)
+                        }
+                    }
+                } else {
+                    drawBox(screen, row, 0, cpuBoxH, leftW, fastTitle)
+                }
+                drawBox(screen, row, half, cpuBoxH, rightW, slowTitle)
+                for (index, core) in cpu.fastCores.enumerated() {
+                    drawCoreRow(screen, row + 1 + index, 2, leftW - 4, fixedLabel(topology.fastPrefix, index + 1), core.activePercent, core.frequencyMHz)
+                }
+                for (index, core) in cpu.slowCores.enumerated() {
+                    drawCoreRow(screen, row + 1 + index, half + 2, rightW - 4, fixedLabel(topology.slowPrefix, index + 1), core.activePercent, core.frequencyMHz)
+                }
+                last = max(last, row + cpuBoxH - 1)
+                row += cpuBoxH
+            }
+        } else if row + 4 < rows {
+            drawUnavailable(screen, row, 0, 4, columns, "CPU")
+            last = max(last, row + 3)
+            row += 4
         }
-    }
 
-    private func powerText(_ value: PowerReading, topology: Topology, histories: DashboardHistories) -> String {
-        let trend = sparkline(histories.cpuPower, maximum: topology.powerLimits.cpuWatts)
-        return String(
-            format: "Power  CPU %.1fW (avg %.1f, peak %.1f) %@  GPU %.1fW (avg %.1f, peak %.1f)  ANE %.1fW  Package %.1fW",
-            value.cpuWatts, value.cpuAverageWatts, value.cpuPeakWatts, trend,
-            value.gpuWatts, value.gpuAverageWatts, value.gpuPeakWatts,
-            value.aneWatts, value.packageWatts
-        )
-    }
-
-    private func networkSection(_ state: MetricState<NetworkReading>, histories: DashboardHistories, now: Date) -> String {
-        switch state {
-        case let .unavailable(reason):
-            return "Network: unavailable (\(reason))"
-        case let .fresh(value, _):
-            return networkText(value, histories: histories)
-        case let .stale(value, observedAt, _):
-            return networkText(value, histories: histories) + " — \(staleText(now: now, observedAt: observedAt))"
+        if row + 3 < rows {
+            if let gpu = metricValue(snapshot.gpu) {
+                var gpuTitle = "GPU: \(gpu.activePercent)% @ \(gpu.frequencyMHz) MHz"
+                if let gpuDieMax {
+                    gpuTitle += "  \(degrees(gpuDieMax))°C"
+                }
+                drawBox(screen, row, 0, 3, columns, gpuTitle)
+                drawHBar(screen, row + 1, 2, columns - 4, gpu.activePercent, "", accentColor)
+            } else {
+                drawUnavailable(screen, row, 0, 3, columns, "GPU")
+            }
+            last = max(last, row + 2)
+            row += 3
         }
-    }
 
-    private func networkText(_ value: NetworkReading, histories: DashboardHistories) -> String {
-        "Network  ↓ \(formatRate(value.inBytesPerSecond)) \(sparkline(histories.networkIn))  ↑ \(formatRate(value.outBytesPerSecond)) \(sparkline(histories.networkOut))"
-    }
-
-    private func diskSection(_ state: MetricState<DiskReading>, histories: DashboardHistories, now: Date) -> String {
-        switch state {
-        case let .unavailable(reason):
-            return "Disk I/O: unavailable (\(reason))"
-        case let .fresh(value, _):
-            return diskText(value, histories: histories)
-        case let .stale(value, observedAt, _):
-            return diskText(value, histories: histories) + " — \(staleText(now: now, observedAt: observedAt))"
+        if row + 3 < rows {
+            if let power = metricValue(snapshot.power) {
+                let pct = anePercent(power.aneWatts, limit: topology.powerLimits.aneWatts)
+                drawBox(screen, row, 0, 3, columns, "ANE: \(pct)% @ \(watts(power.aneWatts))W")
+                drawHBar(screen, row + 1, 2, columns - 4, pct, "", 36)
+            } else {
+                drawUnavailable(screen, row, 0, 3, columns, "ANE")
+            }
+            last = max(last, row + 2)
+            row += 3
         }
-    }
 
-    private func diskText(_ value: DiskReading, histories: DashboardHistories) -> String {
-        "Disk I/O  read \(formatRate(value.readBytesPerSecond)) \(sparkline(histories.diskRead))  write \(formatRate(value.writeBytesPerSecond)) \(sparkline(histories.diskWrite))"
-    }
+        if row + 3 < rows {
+            if let net = metricValue(snapshot.network) {
+                let title = "Net: ↓\(formatRate(net.inBytesPerSecond)) ↑\(formatRate(net.outBytesPerSecond))"
+                drawBox(screen, row, 0, 3, leftW, title)
+                let sparkAvail = leftW - 4
+                if sparkAvail > 10 && histories.networkIn.count > 1 {
+                    let hw = sparkAvail / 2
+                    screen.write(row + 1, 2, "↓", foreground: 36)
+                    drawSpark(screen, row + 1, 3, min(hw - 1, histories.networkIn.count), histories.networkIn, sparkCeiling(histories.networkIn), 36)
+                    let mid = 2 + hw + 1
+                    screen.write(row + 1, mid, "↑", foreground: 31)
+                    drawSpark(screen, row + 1, mid + 1, min(hw - 1, histories.networkOut.count), histories.networkOut, sparkCeiling(histories.networkOut), 31)
+                }
+            } else {
+                drawUnavailable(screen, row, 0, 3, leftW, "Net")
+            }
+            if let disk = metricValue(snapshot.disk) {
+                let title = "Disk: R \(formatRate(disk.readBytesPerSecond)) W \(formatRate(disk.writeBytesPerSecond))"
+                drawBox(screen, row, half, 3, rightW, title)
+                let sparkAvail = rightW - 4
+                if sparkAvail > 10 && histories.diskRead.count > 1 {
+                    let hw = sparkAvail / 2
+                    screen.write(row + 1, half + 2, "R", foreground: 36)
+                    drawSpark(screen, row + 1, half + 3, min(hw - 1, histories.diskRead.count), histories.diskRead, sparkCeiling(histories.diskRead), 36)
+                    let mid = half + 2 + hw + 1
+                    screen.write(row + 1, mid, "W", foreground: 31)
+                    drawSpark(screen, row + 1, mid + 1, min(hw - 1, histories.diskWrite.count), histories.diskWrite, sparkCeiling(histories.diskWrite), 31)
+                }
+            } else {
+                drawUnavailable(screen, row, half, 3, rightW, "Disk")
+            }
+            last = max(last, row + 2)
+            row += 3
+        }
 
-    private func memorySection(_ state: MetricState<MemoryReading>, now: Date) -> String {
-        switch state {
-        case .unavailable:
-            return "Memory: unavailable"
-        case let .fresh(value, _):
-            return memoryText(value)
-        case let .stale(value, observedAt, _):
-            return memoryText(value) + " — \(staleText(now: now, observedAt: observedAt))"
-        }
-    }
+        if row + 7 < rows {
+            if let memory = metricValue(snapshot.memory) {
+                drawBox(screen, row, 0, 7, leftW, "Memory")
+                let ram = "RAM: \(oneDecimal(memory.usedGiB))/\(oneDecimal(memory.totalGiB)) GB (\(memory.percentUsed)%)"
+                screen.write(row + 1, 2, ram, foreground: 37, clipRight: leftW - 1)
+                drawHBar(screen, row + 2, 2, leftW - 4, memory.percentUsed, "", 32)
+                if let total = memory.swapTotalGiB, let used = memory.swapUsedGiB, total > 0.05 {
+                    screen.write(row + 3, 2, "Swap: \(oneDecimal(used))/\(oneDecimal(total)) GB", foreground: 37, clipRight: leftW - 1)
+                } else {
+                    screen.write(row + 3, 2, "Swap: inactive", foreground: 37, dim: true, clipRight: leftW - 1)
+                }
+                let app = oneDecimal(memory.appGiB)
+                let wired = oneDecimal(memory.wiredGiB)
+                let compressed = oneDecimal(memory.compressedGiB)
+                let cached = oneDecimal(memory.cachedGiB)
+                let full = "App \(app)G  Wired \(wired)G  Comp \(compressed)G  Cache \(cached)G"
+                let short = "App \(app)G W \(wired)G C \(compressed)G"
+                let avail = leftW - 4
+                let breakdown = avail >= full.count ? full : (avail >= short.count ? short : "App \(app)G  C \(compressed)G")
+                if avail > 0 {
+                    screen.write(row + 4, 2, String(breakdown.prefix(avail)), foreground: 37, dim: true, clipRight: 2 + avail)
+                }
+            } else {
+                drawUnavailable(screen, row, 0, 7, leftW, "Memory")
+            }
 
-    private func memoryText(_ value: MemoryReading) -> String {
-        let memory = String(
-            format: "Memory  %.1f/%.1f GB (%d%%)  App %.1f  Wired %.1f  Compressed %.1f  Cached %.1f",
-            value.usedGiB, value.totalGiB, value.percentUsed, value.appGiB, value.wiredGiB,
-            value.compressedGiB, value.cachedGiB
-        )
-        guard let used = value.swapUsedGiB, let total = value.swapTotalGiB else {
-            return memory + "  Swap unavailable"
+            if let power = metricValue(snapshot.power) {
+                drawBox(screen, row, half, 7, rightW, "Power")
+                let clip = half + rightW - 1
+                let origin = half + 2
+                screen.write(row + 1, origin, "CPU: \(watts(power.cpuWatts))W  GPU: \(watts(power.gpuWatts))W  ANE: \(watts(power.aneWatts))W  Total: \(watts(power.packageWatts))W", foreground: 37, clipRight: clip)
+                screen.write(row + 2, origin, "CPU avg: \(watts(power.cpuAverageWatts))W pk: \(watts(power.cpuPeakWatts))W  GPU avg: \(watts(power.gpuAverageWatts))W pk: \(watts(power.gpuPeakWatts))W", foreground: 37, dim: true, clipRight: clip)
+                let throttlePrefix = "Package peak: \(watts(power.packagePeakWatts))W  Throttle: "
+                screen.write(row + 3, origin, throttlePrefix, foreground: 37, clipRight: clip)
+                let throttle = thermal == "Nominal" ? "no" : "YES (\(thermal))"
+                screen.write(row + 3, origin + throttlePrefix.count, throttle, foreground: thermal == "Nominal" ? 32 : 31, clipRight: clip)
+                let sparkW = rightW - 8
+                if sparkW > 10 && histories.cpuPower.count > 1 {
+                    screen.write(row + 4, origin, "CPU ", foreground: 37)
+                    drawSpark(screen, row + 4, half + 6, min(sparkW, histories.cpuPower.count), histories.cpuPower, topology.powerLimits.cpuWatts, accentColor)
+                    screen.write(row + 5, origin, "GPU ", foreground: 37)
+                    drawSpark(screen, row + 5, half + 6, min(sparkW, histories.gpuPower.count), histories.gpuPower, topology.powerLimits.gpuWatts, 33)
+                }
+            } else {
+                drawUnavailable(screen, row, half, 7, rightW, "Power")
+            }
+            last = max(last, row + 6)
+            row += 7
         }
-        return memory + String(format: "  Swap %.1f/%.1f GB", used, total)
-    }
 
-    private func temperatureSection(
-        _ state: MetricState<[TemperatureReading]>,
-        now: Date,
-        compact: Bool
-    ) -> String {
-        switch state {
-        case let .unavailable(reason):
-            return "Temperatures: unavailable (\(reason))"
-        case let .fresh(values, _):
-            return temperatureText(values, compact: compact)
-        case let .stale(values, observedAt, _):
-            return temperatureText(values, compact: compact) + " — \(staleText(now: now, observedAt: observedAt))"
-        }
-    }
-
-    private func temperatureText(_ values: [TemperatureReading], compact: Bool) -> String {
-        let classified = TemperatureClassifier.classify(values)
-        var lines = ["Temperatures"]
-        var summary: [String] = []
-        if !classified.cpuDie.isEmpty {
-            let readings = classified.cpuDie.map(\.celsius)
-            summary.append(String(
-                format: "CPU Die %.0f°C (max %.0f°C)",
-                readings.reduce(0, +) / Double(readings.count), readings.max() ?? 0
-            ))
-        }
-        if !classified.gpuDie.isEmpty {
-            let readings = classified.gpuDie.map(\.celsius)
-            summary.append(String(format: "GPU Die %.0f°C", readings.reduce(0, +) / Double(readings.count)))
-        }
-        for name in ["SSD", "Battery"] {
-            if let value = classified.other[name] {
-                summary.append(String(format: "%@ %.0f°C", name, value))
+        let hasTemps = !cpuDie.isEmpty || !gpuDie.isEmpty || !other.isEmpty
+        let tempBoxH = hasTemps ? 6 : 3
+        if row + tempBoxH < rows {
+            if hasTemps {
+                drawBox(screen, row, 0, tempBoxH, columns, "Temperatures")
+                var cy = row + 1
+                var parts: [String] = []
+                let cpuVals = cpuDie.map(\.celsius).filter(\.isFinite)
+                if !cpuVals.isEmpty {
+                    let avg = cpuVals.reduce(0, +) / Double(cpuVals.count)
+                    parts.append("CPU Die: \(degrees(avg))°C (max \(degrees(cpuVals.max() ?? 0))°C)")
+                }
+                let gpuVals = gpuDie.map(\.celsius).filter(\.isFinite)
+                if !gpuVals.isEmpty {
+                    let avg = gpuVals.reduce(0, +) / Double(gpuVals.count)
+                    parts.append("GPU Die: \(degrees(avg))°C")
+                }
+                for label in ["SSD", "Battery"] {
+                    if let value = other[label], value.isFinite {
+                        parts.append("\(label): \(degrees(value))°C")
+                    }
+                }
+                screen.write(cy, 2, parts.joined(separator: "  "), foreground: 37, clipRight: columns - 1)
+                cy += 1
+                if !cpuDie.isEmpty {
+                    drawZones(screen, cy, columns, "CPU ", cpuDie)
+                    cy += 1
+                }
+                if !gpuDie.isEmpty {
+                    drawZones(screen, cy, columns, "GPU ", gpuDie)
+                    cy += 1
+                }
+                let pressureRow = min(cy, row + tempBoxH - 2)
+                screen.write(pressureRow, 2, "Thermal Pressure: ", foreground: 37)
+                screen.write(pressureRow, 2 + "Thermal Pressure: ".count, thermal, foreground: thermal == "Nominal" ? 32 : 31, clipRight: columns - 1)
+                last = max(last, row + tempBoxH - 1)
+                row += tempBoxH
+            } else {
+                screen.write(row, 0, String(repeating: "─", count: columns), foreground: accentColor)
+                row += 1
+                screen.write(row, 2, "Thermal Pressure: ", foreground: 37)
+                screen.write(row, 2 + "Thermal Pressure: ".count, thermal, foreground: thermal == "Nominal" ? 32 : 31, clipRight: columns - 1)
+                last = max(last, row)
+                row += 1
             }
         }
-        lines.append(summary.isEmpty ? "unavailable" : summary.joined(separator: "  "))
-        if !compact, !classified.cpuDie.isEmpty {
-            lines.append("CPU " + classified.cpuDie.map {
-                coloredTemperatureToken(String(format: "z%d:%.0f", $0.zone, $0.celsius), value: $0.celsius)
-            }.joined(separator: " "))
+
+        if row < rows {
+            let y = min(row, rows - 1)
+            screen.write(y, 0, centered(" q: quit | silitop ", columns), foreground: 37, dim: true)
+            last = max(last, y)
         }
-        if !compact, !classified.gpuDie.isEmpty {
-            lines.append("GPU " + classified.gpuDie.map {
-                coloredTemperatureToken(String(format: "z%d:%.0f", $0.zone, $0.celsius), value: $0.celsius)
-            }.joined(separator: " "))
-        }
-        return lines.joined(separator: "\n")
+        return last
     }
 
-    private func coloredTemperatureToken(_ text: String, value: Double) -> String {
-        guard ansi else { return text }
-        let code: Int
-        switch TemperatureBand.forCelsius(value) {
-        case .cool: code = 36
-        case .warm, .warning: code = 33
-        case .hot: code = 31
-        }
-        return "\u{1B}[\(code)m\(text)\(mainColorCode)"
+    private var accentColor: Int {
+        [37, 31, 32, 33, 34, 35, 36][colorScheme]
     }
 
-    private func thermalSection(_ state: MetricState<String>, now: Date) -> String {
+    private func drawBox(_ screen: LegacyScreen, _ y: Int, _ x: Int, _ h: Int, _ w: Int, _ title: String) {
+        guard h >= 2, w >= 4 else { return }
+        let horizontal = String(repeating: "─", count: w - 2)
+        screen.write(y, x, "┌" + horizontal + "┐", foreground: accentColor)
+        if !title.isEmpty {
+            let titled = " \(title) "
+            if x + 2 + titled.count < x + w - 1 {
+                screen.write(y, x + 2, titled, foreground: accentColor, bold: true)
+            }
+        }
+        if h > 2 {
+            for line in (y + 1)..<(y + h - 1) {
+                screen.write(line, x, "│", foreground: accentColor)
+                screen.write(line, x + w - 1, "│", foreground: accentColor)
+            }
+        }
+        screen.write(y + h - 1, x, "└" + horizontal + "┘", foreground: accentColor)
+    }
+
+    private func drawUnavailable(_ screen: LegacyScreen, _ y: Int, _ x: Int, _ h: Int, _ w: Int, _ title: String) {
+        drawBox(screen, y, x, h, w, title)
+        guard h >= 2, w >= 6 else { return }
+        var message = "data unavailable"
+        if message.count > w - 4 { message = "unavailable" }
+        let mid = y + max(1, h / 2)
+        let column = x + max(1, (w - message.count) / 2)
+        screen.write(mid, column, message, foreground: 33, dim: true, clipRight: x + w - 1)
+    }
+
+    private func drawCoreRow(
+        _ screen: LegacyScreen,
+        _ y: Int,
+        _ x: Int,
+        _ width: Int,
+        _ label: String,
+        _ percent: Int,
+        _ frequencyMHz: Int
+    ) {
+        guard width >= 20 else { return }
+        let pct = min(100, max(0, percent))
+        let pctText = String(format: "%3d%%", pct)
+        let frequency = padLeft(frequencyMHz >= 1_000 ? String(format: "%.1fG", Double(frequencyMHz) / 1_000) : "\(frequencyMHz)M", 4)
+        let suffix = " \(pctText) \(frequency)"
+        let labelText = label + " "
+        let layout = barGeometry(width: width, percent: pct, label: labelText, suffix: suffix)
+        let clip = x + width
+        screen.write(y, x, labelText, foreground: 37, bold: true, clipRight: clip)
+        screen.write(y, x + layout.labelWidth, String(repeating: "█", count: layout.fill), foreground: accentColor, bold: true, clipRight: clip)
+        screen.write(y, x + layout.labelWidth + layout.fill, String(repeating: "░", count: layout.empty), foreground: 37, dim: true, clipRight: clip)
+        screen.write(y, x + layout.suffixStart, " " + pctText, foreground: 37, clipRight: clip)
+        screen.write(y, x + layout.suffixStart + 1 + pctText.count, " " + frequency, foreground: 36, clipRight: clip)
+    }
+
+    private func drawFanRow(
+        _ screen: LegacyScreen,
+        _ y: Int,
+        _ x: Int,
+        _ width: Int,
+        _ label: String,
+        _ percent: Int,
+        _ rpm: Double
+    ) {
+        guard width >= 20 else { return }
+        let pct = min(100, max(0, percent))
+        let pctText = String(format: "%3d%%", pct)
+        let rpmText = padLeft("\(safeInt(rpm))r", 5)
+        let suffix = " \(pctText) \(rpmText)"
+        let labelText = label + " "
+        let layout = barGeometry(width: width, percent: pct, label: labelText, suffix: suffix)
+        let clip = x + width
+        screen.write(y, x, labelText, foreground: 37, bold: true, clipRight: clip)
+        screen.write(y, x + layout.labelWidth, String(repeating: "█", count: layout.fill), foreground: accentColor, bold: true, clipRight: clip)
+        screen.write(y, x + layout.labelWidth + layout.fill, String(repeating: "░", count: layout.empty), foreground: 37, dim: true, clipRight: clip)
+        screen.write(y, x + layout.suffixStart, " " + pctText, foreground: 37, clipRight: clip)
+        screen.write(y, x + layout.suffixStart + 1 + pctText.count, " " + rpmText, foreground: 36, clipRight: clip)
+    }
+
+    private func drawHBar(
+        _ screen: LegacyScreen,
+        _ y: Int,
+        _ x: Int,
+        _ width: Int,
+        _ percent: Int,
+        _ label: String,
+        _ foreground: Int
+    ) {
+        guard width >= 10 else { return }
+        let pct = min(100, max(0, percent))
+        let pctText = String(format: " %3d%%", pct)
+        let labelText = label.isEmpty ? "" : label + " "
+        let layout = barGeometry(width: width, percent: pct, label: labelText, suffix: pctText)
+        let clip = x + width
+        if !labelText.isEmpty {
+            screen.write(y, x, labelText, foreground: 37, clipRight: clip)
+        }
+        screen.write(y, x + layout.labelWidth, String(repeating: "█", count: layout.fill), foreground: foreground, bold: true, clipRight: clip)
+        screen.write(y, x + layout.labelWidth + layout.fill, String(repeating: "░", count: layout.empty), foreground: 37, dim: true, clipRight: clip)
+        screen.write(y, x + layout.suffixStart, pctText, foreground: 37, clipRight: clip)
+    }
+
+    private func drawSpark(
+        _ screen: LegacyScreen,
+        _ y: Int,
+        _ x: Int,
+        _ width: Int,
+        _ values: [Double],
+        _ maximum: Double,
+        _ foreground: Int
+    ) {
+        guard width >= 3, !values.isEmpty else { return }
+        let glyphs = Array("▁▂▃▄▅▆▇█")
+        let scale = maximum.isFinite ? max(maximum, 0.01) : 0.01
+        for (offset, raw) in values.suffix(width).enumerated() {
+            let sample = raw.isFinite ? raw : 0
+            let ratio = min(max(sample / scale, 0), 1)
+            let index = min(glyphs.count - 1, Int(ratio * Double(glyphs.count - 1)))
+            screen.write(y, x + offset, String(glyphs[index]), foreground: foreground)
+        }
+    }
+
+    private func drawZones(
+        _ screen: LegacyScreen,
+        _ y: Int,
+        _ columns: Int,
+        _ prefix: String,
+        _ zones: [DieTemperature]
+    ) {
+        var cx = 2
+        screen.write(y, cx, prefix, foreground: 37, dim: true)
+        cx += prefix.count
+        for zone in zones where zone.celsius.isFinite {
+            let entry = "z\(zone.zone):\(degrees(zone.celsius))"
+            if cx + entry.count + 1 > columns - 2 { break }
+            screen.write(y, cx, entry, foreground: temperatureColor(zone.celsius))
+            cx += entry.count + 1
+        }
+    }
+
+    private func barGeometry(width: Int, percent: Int, label: String, suffix: String) -> (labelWidth: Int, fill: Int, empty: Int, suffixStart: Int) {
+        let total = max(width, 0)
+        let pct = min(100, max(0, percent))
+        let labelWidth = min(label.count, total)
+        let suffixStart = min(max(labelWidth, total - suffix.count), total)
+        let barWidth = max(suffixStart - labelWidth, 0)
+        let fill = min(barWidth, Int(Double(pct) / 100 * Double(barWidth)))
+        return (labelWidth, fill, barWidth - fill, suffixStart)
+    }
+
+    private func metricValue<T>(_ state: MetricState<T>) -> T? {
         switch state {
-        case let .unavailable(reason):
-            return "Thermal Pressure: unavailable (\(reason))"
-        case let .fresh(value, _):
-            return "Thermal Pressure: \(value)"
-        case let .stale(value, observedAt, _):
-            return "Thermal Pressure: \(value) — \(staleText(now: now, observedAt: observedAt))"
+        case .unavailable:
+            return nil
+        case let .fresh(value, _), let .stale(value, _, _):
+            return value
         }
     }
 
-    private func staleText(now: Date, observedAt: Date) -> String {
-        "stale \(max(0, Int(now.timeIntervalSince(observedAt).rounded())))s"
+    private func fanList(_ state: MetricState<FanCollection>) -> [FanReading] {
+        guard let collection = metricValue(state), case let .fans(fans) = collection else { return [] }
+        return fans
     }
 
-    private func formatFrequency(_ value: Int) -> String {
-        value >= 1_000 ? String(format: "%.1fG", Double(value) / 1_000) : "\(value)M"
+    private func thermalText(_ state: MetricState<String>) -> String {
+        switch state {
+        case .unavailable:
+            return "Unknown"
+        case let .fresh(value, _), let .stale(value, _, _):
+            return value
+        }
+    }
+
+    private func temperatureColor(_ value: Double) -> Int {
+        guard value.isFinite, value >= 0 else { return 33 }
+        if value < 50 { return 36 }
+        if value <= 70 { return 33 }
+        return 31
+    }
+
+    private func anePercent(_ wattsValue: Double, limit: Double) -> Int {
+        guard wattsValue.isFinite, limit.isFinite, limit > 0 else { return 0 }
+        return min(100, max(0, safeInt(wattsValue / limit * 100)))
+    }
+
+    private func safeInt(_ value: Double) -> Int {
+        guard value.isFinite else { return 0 }
+        if value >= Double(Int.max) { return Int.max }
+        if value <= Double(Int.min) { return Int.min }
+        return Int(value)
+    }
+
+    private func watts(_ value: Double) -> String {
+        value.isFinite ? String(format: "%.1f", value) : "nan"
+    }
+
+    private func oneDecimal(_ value: Double) -> String {
+        value.isFinite ? String(format: "%.1f", value) : "nan"
+    }
+
+    private func degrees(_ value: Double) -> String {
+        String(format: "%.0f", value)
+    }
+
+    private func finiteMax(_ values: [Double]) -> Double? {
+        values.filter(\.isFinite).max()
+    }
+
+    private func countText(_ value: Int?) -> String {
+        value.map(String.init) ?? "?"
+    }
+
+    private func fixedLabel(_ prefix: String, _ number: Int) -> String {
+        let digits = String(number)
+        guard digits.count < 2 else { return prefix + digits }
+        return prefix + digits + String(repeating: " ", count: 2 - digits.count)
+    }
+
+    private func padLeft(_ text: String, _ width: Int) -> String {
+        guard text.count < width else { return text }
+        return String(repeating: " ", count: width - text.count) + text
+    }
+
+    private func centered(_ text: String, _ width: Int) -> String {
+        guard text.count < width else { return text }
+        let pad = width - text.count
+        let left = pad / 2
+        return String(repeating: " ", count: left) + text + String(repeating: " ", count: pad - left)
     }
 
     private func formatRate(_ value: Double) -> String {
-        if value >= 1_073_741_824 { return String(format: "%.1f GiB/s", value / 1_073_741_824) }
-        if value >= 1_048_576 { return String(format: "%.1f MiB/s", value / 1_048_576) }
-        if value >= 1_024 { return String(format: "%.1f KiB/s", value / 1_024) }
+        guard value.isFinite else { return "0 B/s" }
+        if value >= 1_073_741_824 { return String(format: "%.1f GB/s", value / 1_073_741_824) }
+        if value >= 1_048_576 { return String(format: "%.1f MB/s", value / 1_048_576) }
+        if value >= 1_024 { return String(format: "%.0f KB/s", value / 1_024) }
         return String(format: "%.0f B/s", value)
     }
 
-    private func sparkline(_ values: [Double], maximum fixedMaximum: Double? = nil) -> String {
-        let validValues = values.map { $0.isFinite && $0 >= 0 ? $0 : 0 }
-        let requestedMaximum = fixedMaximum.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
-        guard let maximum = requestedMaximum ?? validValues.max(), maximum > 0 else { return "" }
-        let glyphs = Array("▁▂▃▄▅▆▇█")
-        return String(validValues.suffix(12).map { value in
-            let ratio = min(1, max(0, value / maximum))
-            let index = Int((ratio * Double(glyphs.count - 1)).rounded(.towardZero))
-            return glyphs[index]
-        })
+    private func sparkCeiling(_ values: [Double]) -> Double {
+        max(values.filter(\.isFinite).max() ?? 1, 1)
+    }
+}
+
+private struct LegacyGlyph: Equatable {
+    var character: Character = " "
+    var foreground: Int?
+    var bold = false
+    var dim = false
+    var reverse = false
+
+    var style: (Int?, Bool, Bool, Bool) {
+        (foreground, bold, dim, reverse)
+    }
+}
+
+private final class LegacyScreen {
+    let rows: Int
+    let columns: Int
+    private var cells: [LegacyGlyph]
+
+    init(rows: Int, columns: Int) {
+        self.rows = rows
+        self.columns = columns
+        cells = Array(repeating: LegacyGlyph(), count: rows * columns)
+    }
+
+    func write(
+        _ y: Int,
+        _ x: Int,
+        _ text: String,
+        foreground: Int? = nil,
+        bold: Bool = false,
+        dim: Bool = false,
+        reverse: Bool = false,
+        clipRight: Int? = nil
+    ) {
+        guard rows > 0, columns > 0, y >= 0, y < rows, !text.isEmpty else { return }
+        var column = x
+        var characters = Array(text)
+        if column < 0 {
+            let skip = min(characters.count, -column)
+            characters.removeFirst(skip)
+            column = 0
+        }
+        let limit = min(columns, clipRight ?? columns)
+        for character in characters {
+            if column >= limit { break }
+            cells[y * columns + column] = LegacyGlyph(
+                character: character,
+                foreground: foreground,
+                bold: bold,
+                dim: dim,
+                reverse: reverse
+            )
+            column += 1
+        }
+    }
+
+    func encode(through lastRow: Int, ansi: Bool) -> Data {
+        guard rows > 0, columns > 0 else {
+            return Data((ansi ? "\u{1B}[H\u{1B}[J\u{1B}[0m" : "").utf8)
+        }
+        let end = min(rows - 1, max(0, lastRow))
+        var text = ansi ? "\u{1B}[H" : ""
+        var previous: (Int?, Bool, Bool, Bool)?
+        for y in 0...end {
+            if y > 0 { text.append("\n") }
+            for x in 0..<columns {
+                let glyph = cells[y * columns + x]
+                let style = glyph.style
+                let styleChanged: Bool
+                if let previous {
+                    styleChanged = previous != style
+                } else {
+                    styleChanged = true
+                }
+                if ansi, styleChanged {
+                    text.append(contentsOf: sgr(glyph))
+                    previous = style
+                }
+                text.append(glyph.character)
+            }
+        }
+        text.append("\n")
+        if ansi { text.append(contentsOf: "\u{1B}[J\u{1B}[0m") }
+        return Data(text.utf8)
+    }
+
+    private func sgr(_ glyph: LegacyGlyph) -> String {
+        var codes = ["0"]
+        if glyph.bold { codes.append("1") }
+        if glyph.dim { codes.append("2") }
+        if glyph.reverse { codes.append("7") }
+        if let foreground = glyph.foreground { codes.append(String(foreground)) }
+        return "\u{1B}[" + codes.joined(separator: ";") + "m"
     }
 }
