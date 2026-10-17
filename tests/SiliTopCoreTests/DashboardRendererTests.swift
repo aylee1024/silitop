@@ -239,6 +239,98 @@ final class DashboardRendererTests: XCTestCase {
         XCTAssertTrue(text.contains("GPU:"))
     }
 
+    func testIdlePowerUsesTwentyWattFloor() {
+        let lines = renderLines(histories: DashboardHistories(
+            cpuPower: [0, 10, .nan],
+            gpuPower: [1, 1]
+        ), rows: 60)
+        let spark = powerSpark(lines, label: "CPU ")
+        XCTAssertEqual(Array(spark.top.prefix(3)), [" ", " ", " "])
+        XCTAssertEqual(Array(spark.bottom.prefix(3)), ["▁", "█", "▁"])
+    }
+
+    func testCpuAndGpuSparksUseSeparateVisiblePeaks() {
+        let lines = renderLines(histories: DashboardHistories(
+            cpuPower: [80, 40],
+            gpuPower: [5, 5]
+        ), rows: 60)
+        let cpu = powerSpark(lines, label: "CPU ")
+        let gpu = powerSpark(lines, label: "GPU ")
+        XCTAssertEqual(Array(cpu.top.prefix(2)), ["█", " "])
+        XCTAssertEqual(Array(cpu.bottom.prefix(2)), ["█", "█"])
+        XCTAssertEqual(Array(gpu.top.prefix(2)), [" ", " "])
+        XCTAssertEqual(Array(gpu.bottom.prefix(2)), ["▄", "▄"])
+    }
+
+    func testScrolledOffSpikeDoesNotRaiseTheVisibleTop() {
+        let lines = renderLines(histories: DashboardHistories(
+            cpuPower: [80] + Array(repeating: 10, count: 50),
+            gpuPower: [1, 1],
+            networkIn: [1_000_000] + Array(repeating: 1_000, count: 30),
+            networkOut: [1, 1]
+        ), rows: 60)
+        let cpu = powerSpark(lines, label: "CPU ")
+        XCTAssertEqual(Array(cpu.top.prefix(41)), Array(repeating: " ", count: 41))
+        XCTAssertEqual(Array(cpu.bottom.prefix(41)), Array(repeating: "█", count: 41))
+
+        guard let net = lines.firstIndex(where: { $0.contains("Net: ↓") }) else {
+            XCTFail("missing net title")
+            return
+        }
+        let upper = Array(lines[net + 1])
+        let lower = Array(lines[net + 2])
+        guard let arrow = upper.firstIndex(of: "↓") else {
+            XCTFail("missing download mark")
+            return
+        }
+        let start = arrow + 1
+        XCTAssertEqual(Array(upper[start..<(start + 21)]), Array(repeating: "█", count: 21))
+        XCTAssertEqual(Array(lower[start..<(start + 21)]), Array(repeating: "█", count: 21))
+    }
+
+    func testFortyRowsDropTemperaturesAndFortyOneShowsThem() {
+        let histories = DashboardHistories.example
+        let forty = String(decoding: DashboardRenderer(ansi: false).render(
+            snapshot: completeSnapshot(),
+            histories: histories,
+            size: TerminalSize(rows: 40, columns: 100)
+        ), as: UTF8.self)
+        XCTAssertTrue(forty.contains("CPU: 5.0W"))
+        XCTAssertTrue(forty.contains("Disk:"))
+        XCTAssertTrue(forty.contains("q: quit | silitop"))
+        XCTAssertFalse(forty.contains("Temperatures"))
+        XCTAssertLessThanOrEqual(forty.split(separator: "\n").count, 40)
+
+        let fortyOne = String(decoding: DashboardRenderer(ansi: false).render(
+            snapshot: completeSnapshot(),
+            histories: histories,
+            size: TerminalSize(rows: 41, columns: 100)
+        ), as: UTF8.self)
+        XCTAssertTrue(fortyOne.contains("Temperatures"))
+        XCTAssertTrue(fortyOne.contains("q: quit | silitop"))
+        XCTAssertLessThanOrEqual(fortyOne.split(separator: "\n").count, 41)
+    }
+
+    private func renderLines(histories: DashboardHistories, rows: Int) -> [String] {
+        let text = String(decoding: DashboardRenderer(ansi: false).render(
+            snapshot: completeSnapshot(),
+            histories: histories,
+            size: TerminalSize(rows: rows, columns: 100)
+        ), as: UTF8.self)
+        return text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+    }
+
+    private func powerSpark(_ lines: [String], label: String) -> (top: [Character], bottom: [Character]) {
+        let watts = lines.firstIndex { $0.contains("CPU: 5.0W") }!
+        let offset = label == "GPU " ? 5 : 3
+        let upper = Array(lines[watts + offset])
+        let lower = Array(lines[watts + offset + 1])
+        let upperText = String(upper)
+        let range = upperText.range(of: label)!
+        let start = upperText.distance(from: upperText.startIndex, to: range.upperBound)
+        return (Array(upper[start...]), Array(lower[start...]))
+    }
+
     private func completeSnapshot() -> DashboardSnapshot {
         let topology = Topology(
             name: "Apple M5 Pro",
