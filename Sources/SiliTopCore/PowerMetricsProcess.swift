@@ -30,12 +30,13 @@ public struct PowerMetricsCommand: Equatable, Sendable {
 
     public init(intervalSeconds: Int, samplerSet: PowerMetricsSamplerSet) {
         let safeInterval = max(1, min(intervalSeconds, Int.max / 1_000))
+        // No -o flag. powermetrics treats "-o -" as a file named "-", appends
+        // every sample to it, and leaves the pipe empty.
         executable = "/usr/bin/nice"
         arguments = [
             "-n", "10", "/usr/bin/powermetrics",
             "-b", "0",
             "-f", "plist",
-            "-o", "-",
             "-i", String(safeInterval * 1_000),
             "--samplers", samplerSet.value,
             "--handle-invalid-values",
