@@ -224,6 +224,53 @@ final class PowerMetricsDecoderTests: XCTestCase {
         XCTAssertNil(sample?.gpu)
         XCTAssertNotNil(sample?.network)
     }
+
+    func testNaNIdleRatioDoesNotAbortTheRestOfTheSample() throws {
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict>
+        <key>processor</key><dict>
+          <key>clusters</key><array><dict>
+            <key>name</key><string>S-Cluster</string>
+            <key>freq_hz</key><real>4000000000</real>
+            <key>cpus</key><array>
+              <dict>
+                <key>cpu</key><integer>0</integer>
+                <key>idle_ratio</key><real>nan</real>
+                <key>freq_hz</key><real>4000000000</real>
+              </dict>
+              <dict>
+                <key>cpu</key><integer>1</integer>
+                <key>idle_ratio</key><real>0.5</real>
+                <key>freq_hz</key><real>3000000000</real>
+              </dict>
+            </array>
+          </dict></array>
+          <key>cpu_energy</key><real>1000</real>
+          <key>gpu_energy</key><real>1000</real>
+          <key>ane_energy</key><real>0</real>
+          <key>combined_power</key><real>1000</real>
+        </dict>
+        <key>gpu</key><dict>
+          <key>idle_ratio</key><real>nan</real>
+          <key>freq_hz</key><real>1000</real>
+        </dict>
+        <key>network</key><dict>
+          <key>ibyte_rate</key><real>1024</real>
+          <key>obyte_rate</key><real>2048</real>
+        </dict>
+        </dict></plist>
+        """
+
+        let sample = PowerMetricsDecoder(topology: topology).decode(plistRecord: Data(xml.utf8))
+
+        XCTAssertNotNil(sample)
+        XCTAssertNil(sample?.gpu)
+        XCTAssertEqual(sample?.cpu?.fastCores.map(\.id), [1])
+        XCTAssertEqual(sample?.cpu?.fastCores.first?.activePercent, 50)
+        XCTAssertEqual(sample?.network?.inBytesPerSecond, 1_024)
+    }
 }
 
 final class TimingContractTests: XCTestCase {

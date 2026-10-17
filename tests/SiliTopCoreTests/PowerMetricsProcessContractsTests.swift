@@ -12,6 +12,7 @@ final class PowerMetricsProcessContractsTests: XCTestCase {
             "-n", "10", "/usr/bin/powermetrics",
             "-b", "0", "-f", "plist", "-o", "-", "-i", "5000",
             "--samplers", "cpu_power,gpu_power,thermal,network,disk",
+            "--handle-invalid-values",
         ])
     }
 
@@ -34,11 +35,15 @@ final class PowerMetricsProcessContractsTests: XCTestCase {
                 XCTAssertTrue(text.contains("    \(sampler) "), "Unsupported sampler: \(sampler)")
             }
         }
+        XCTAssertTrue(text.contains("--handle-invalid-values"))
     }
 
     func testEssentialRetryDropsOptionalSamplerSections() {
         let command = PowerMetricsCommand(intervalSeconds: 1, samplerSet: .essential)
-        XCTAssertEqual(command.arguments.last, "cpu_power,gpu_power,thermal")
+        XCTAssertEqual(
+            Array(command.arguments.suffix(3)),
+            ["--samplers", "cpu_power,gpu_power,thermal", "--handle-invalid-values"]
+        )
     }
 
     func testStallDeadlineIsAtLeastThreeSecondsAndThreeIntervals() {

@@ -44,7 +44,7 @@ cd silitop
 bash install.sh
 ```
 
-The installer builds a stripped release executable as your user, then atomically installs it at `/usr/local/bin/silitop` as `root:wheel` mode `0755`. Set `SILITOP_INSTALL_DIR` to choose another directory.
+The installer builds a stripped release executable in a temporary directory as your user, deletes that directory when it finishes, then atomically installs the binary at `/usr/local/bin/silitop` as `root:wheel` mode `0755`. Set `SILITOP_INSTALL_DIR` to choose another directory.
 
 Upgrade by running `bash install.sh` again. The installer removes helper binaries left by older Python-based releases.
 
@@ -67,7 +67,7 @@ sudo silitop
 | `--avg N` | `30` | Power averaging window in seconds; must be at least the interval |
 | `--test-temps` | — | Print temperature readings and exit without root |
 
-Press `q`, `Esc`, or Ctrl-C to quit. The original terminal mode, cursor, and screen are restored on normal quit, signals, startup failure, collector death, or a stalled stream.
+Press `q`, `Esc`, or Ctrl-C to quit. The original terminal mode, cursor, and screen are restored on normal quit, signals, startup failure, or a stalled stream. After a good sample, if `powermetrics` exits, silitop starts it again and keeps the last frame.
 
 ## Architecture
 
@@ -76,12 +76,12 @@ silitop (native Swift executable)
   ├─ kqueue: terminal input, resize/signals, child pipes/exits, stall timer
   ├─ powermetrics (one recurring child; NUL-delimited plist on stdout)
   ├─ host_statistics64 + sysctlbyname (memory, swap, topology)
+  ├─ IORegistry AGXAccelerator gpu-core-count (one startup read)
   ├─ IOHIDEventSystemClient (persistent temperature collector)
-  ├─ AppleSMC / IOKit (persistent fan collector)
-  └─ system_profiler (one concurrent, startup-only topology fallback)
+  └─ AppleSMC / IOKit (persistent fan collector)
 ```
 
-The full `cpu_power,gpu_power,thermal,network,disk` sampler set is attempted first. If that set is rejected before a valid record, silitop retries once with the essential CPU/GPU/thermal set. Malformed or oversized records are skipped; a missing section only disables its own panel. A stream with no valid plist for `max(3 seconds, 3 × interval)` exits cleanly with a diagnostic.
+The running process creates no files. `powermetrics` is started with `-o -` and `--handle-invalid-values`, so samples stay on the pipe and a NaN reading is data, not an abort. The full `cpu_power,gpu_power,thermal,network,disk` sampler set is attempted first. If that set is rejected before a valid record, silitop retries once with the essential CPU/GPU/thermal set. Malformed or oversized records are skipped; a missing section only disables its own panel. A non-finite idle ratio drops that core or the GPU panel and leaves the rest of the sample. A stream with no valid plist for `max(3 seconds, 3 × interval)` before the first good sample exits cleanly with a diagnostic. After a good sample, a dead collector is restarted. Three immediate exits with no new sample still quit, so a broken launch cannot spin. The installer builds in a temporary directory and deletes it when it finishes.
 
 Temperature access uses private IOHID symbols that are resolved at runtime so a missing or changed API produces an explicit unavailable state instead of a launch failure. Sensor handles stay open and are rebuilt after read failures. Warm temperature work is bounded below the 20 ms p99 release gate on the M5 Pro reference system.
 

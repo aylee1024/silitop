@@ -1,21 +1,48 @@
 import Foundation
+import IOKit
+
+public enum GPUCoreCountReader {
+    // One registry lookup. AGXAccelerator publishes this count; there is no file.
+    public static func read() -> Int? {
+        let service = IOServiceGetMatchingService(
+            kIOMainPortDefault,
+            IOServiceMatching("AGXAccelerator")
+        )
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        guard let property = IORegistryEntryCreateCFProperty(
+            service,
+            "gpu-core-count" as CFString,
+            kCFAllocatorDefault,
+            0
+        )?.takeRetainedValue() as? NSNumber else {
+            return nil
+        }
+        let count = property.intValue
+        return count > 0 ? count : nil
+    }
+}
 
 public struct TopologyDetector {
     private let readSysctl: (String) -> String?
     private let readIntegerSysctl: (String) -> UInt64?
+    private let readGPUCoreCount: () -> Int?
 
     public init(
         sysctl: @escaping (String) -> String?,
-        integerSysctl: @escaping (String) -> UInt64? = { _ in nil }
+        integerSysctl: @escaping (String) -> UInt64? = { _ in nil },
+        gpuCoreCount: @escaping () -> Int? = { nil }
     ) {
         readSysctl = sysctl
         readIntegerSysctl = integerSysctl
+        readGPUCoreCount = gpuCoreCount
     }
 
     public func detect() -> Topology {
         let fastLabel = nonempty(readSysctl("hw.perflevel0.name")) ?? "Performance"
         let slowLabel = nonempty(readSysctl("hw.perflevel1.name")) ?? "Efficiency"
         let name = nonempty(readSysctl("machdep.cpu.brand_string"))
+        let gpuCores = readGPUCoreCount()
         return Topology(
             name: name,
             fastLabel: fastLabel,
@@ -24,7 +51,7 @@ public struct TopologyDetector {
             slowPrefix: prefix(of: slowLabel, fallback: "S"),
             fastCoreCount: coreCount(level: 0),
             slowCoreCount: coreCount(level: 1),
-            gpuCoreCount: nil
+            gpuCoreCount: (gpuCores ?? 0) > 0 ? gpuCores : nil
         )
     }
 

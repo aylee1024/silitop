@@ -140,21 +140,91 @@ final class DashboardApplicationTests: XCTestCase {
         XCTAssertNotEqual(restored.c_lflag & tcflag_t(ICANON), 0)
     }
 
-    func testSamplerDeathAfterValidRecordIsFatalAndRestoresTerminal() throws {
+    func testSamplerDeathAfterAGoodSampleRestartsAndStaysUp() throws {
         let pty = try makePTY(rows: 40, columns: 100)
         defer { Darwin.close(pty.master); Darwin.close(pty.slave) }
+        _ = fcntl(pty.master, F_SETFL, fcntl(pty.master, F_GETFL) | O_NONBLOCK)
         let fixture = try writeFixture()
-        defer { try? FileManager.default.removeItem(at: fixture) }
+        let counter = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer {
+            try? FileManager.default.removeItem(at: fixture)
+            try? FileManager.default.removeItem(at: counter)
+        }
         let command = ChildCommand(
             executable: "/usr/bin/python3",
-            arguments: ["-c", "import os;d=open(r'\(fixture.path)','rb').read();os.write(1,d+b'\\0')"]
+            arguments: ["-c", """
+            import os, time
+            p = r'\(counter.path)'
+            n = int(open(p).read()) if os.path.exists(p) else 0
+            open(p, 'w').write(str(n + 1))
+            if n == 0:
+                os.write(1, open(r'\(fixture.path)', 'rb').read() + b'\\0')
+            else:
+                time.sleep(30)
+            """]
         )
         let application = DashboardApplication(
             options: CLIOptions(),
             terminal: TerminalSession(inputFD: pty.slave, outputFD: pty.slave),
             runtime: DashboardRuntimeConfiguration(
                 samplerCommands: [command], profilerCommand: nil,
-                watchesSignals: false, stallTimeoutOverride: 1
+                watchesSignals: false, stallTimeoutOverride: 5
+            )
+        )
+        let finished = expectation(description: "quit after restart")
+        let result = LockedResult()
+        DispatchQueue.global().async {
+            do { try application.run() } catch { result.error = error }
+            finished.fulfill()
+        }
+
+        _ = waitForOutput(pty.master, containing: "Disk I/O", timeout: 3)
+        let restartDeadline = Date().addingTimeInterval(3)
+        var launches = ""
+        while Date() < restartDeadline {
+            launches = (try? String(contentsOf: counter, encoding: .utf8)) ?? ""
+            if launches == "2" { break }
+            usleep(1_000)
+        }
+        XCTAssertEqual(launches, "2")
+        var quit = UInt8(ascii: "q")
+        XCTAssertEqual(Darwin.write(pty.master, &quit, 1), 1)
+        wait(for: [finished], timeout: 2)
+
+        XCTAssertNil(result.error)
+        var restored = termios()
+        XCTAssertEqual(tcgetattr(pty.slave, &restored), 0)
+        XCTAssertNotEqual(restored.c_lflag & tcflag_t(ICANON), 0)
+    }
+
+    func testThreeImmediateDeathsAfterAGoodSampleExitAndRestoreTheTerminal() throws {
+        let pty = try makePTY(rows: 40, columns: 100)
+        defer { Darwin.close(pty.master); Darwin.close(pty.slave) }
+        let fixture = try writeFixture()
+        let counter = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer {
+            try? FileManager.default.removeItem(at: fixture)
+            try? FileManager.default.removeItem(at: counter)
+        }
+        let command = ChildCommand(
+            executable: "/usr/bin/python3",
+            arguments: ["-c", """
+            import os
+            p = r'\(counter.path)'
+            n = int(open(p).read()) if os.path.exists(p) else 0
+            open(p, 'w').write(str(n + 1))
+            if n == 0:
+                os.write(1, open(r'\(fixture.path)', 'rb').read() + b'\\0')
+            """]
+        )
+        let application = DashboardApplication(
+            options: CLIOptions(),
+            terminal: TerminalSession(inputFD: pty.slave, outputFD: pty.slave),
+            runtime: DashboardRuntimeConfiguration(
+                samplerCommands: [command], profilerCommand: nil,
+                watchesSignals: false,
+                stallTimeoutOverride: 30,
+                fastFailureWindow: 5
             )
         )
 

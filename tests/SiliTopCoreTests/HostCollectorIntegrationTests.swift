@@ -17,4 +17,11 @@ final class HostCollectorIntegrationTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(result?.percentUsed ?? -1, 0)
         XCTAssertLessThanOrEqual(result?.percentUsed ?? 101, 100)
     }
+
+    func testGPUCoreCountComesFromTheAcceleratorRegistry() {
+        let count = GPUCoreCountReader.read()
+
+        XCTAssertNotNil(count)
+        XCTAssertGreaterThan(count ?? 0, 0)
+    }
 }

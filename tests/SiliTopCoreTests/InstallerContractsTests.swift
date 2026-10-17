@@ -18,6 +18,8 @@ final class InstallerContractsTests: XCTestCase {
     func testBuildsAndStripsOneReleaseExecutableWithoutPythonOrHelpers() throws {
         let script = try script
         XCTAssertTrue(script.contains("swift build -c release --product silitop"))
+        XCTAssertTrue(script.contains("--build-path \"${BUILD_PATH}\""))
+        XCTAssertTrue(script.contains("rm -rf \"${BUILD_PATH}\""))
         XCTAssertTrue(script.contains("strip \"${BINARY}\""))
         XCTAssertFalse(script.contains("python3"))
         XCTAssertFalse(script.contains("swiftc -O silitop-temps.swift"))
